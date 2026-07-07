@@ -372,7 +372,7 @@ class RetargetingEvaluator:
 
         return 1 - np.sum(worst_miss_contact) / len(q_trajectory)
 
-    def detect_foot_sliding(self, q_trajectory, contact_sequences):
+    def detect_foot_sliding(self, q_trajectory, contact_sequences, fps):
         """
         Detect foot sliding during contact phases.
 
@@ -396,8 +396,10 @@ class RetargetingEvaluator:
         left_toe_positions = np.array(left_toe_positions)
         right_toe_positions = np.array(right_toe_positions)
 
-        left_toe_xy_velocities = np.linalg.norm(np.diff(left_toe_positions[:, :2], axis=0), axis=1)
-        right_toe_xy_velocities = np.linalg.norm(np.diff(right_toe_positions[:, :2], axis=0), axis=1)
+        if not np.isfinite(fps) or fps <= 0:
+            raise ValueError(f"fps must be finite and positive, got {fps}")
+        left_toe_xy_velocities = np.linalg.norm(np.diff(left_toe_positions[:, :2], axis=0), axis=1) * fps
+        right_toe_xy_velocities = np.linalg.norm(np.diff(right_toe_positions[:, :2], axis=0), axis=1) * fps
         left_toe_xy_velocities = np.concatenate([[0], left_toe_xy_velocities])
         right_toe_xy_velocities = np.concatenate([[0], right_toe_xy_velocities])
 
@@ -443,9 +445,10 @@ class RetargetingEvaluator:
         penetration_duration, penetration_max_depths = self.evaluate_penetration(q_retarget)
 
         human_joints, object_poses = load_intermimic_data(f"{input_data_dir}/{task_name}.pt")
-        contact_sequences = extract_foot_sticking_sequence_velocity(human_joints, self.demo_joints, ["L_Toe", "R_Toe"])
+        fps = float(np.asarray(rt_res_data.get("fps", 30)).reshape(-1)[0])
+        contact_sequences = extract_foot_sticking_sequence_velocity(human_joints, self.demo_joints, ["L_Toe", "R_Toe"], fps)
         sliding_duration, max_toe_sliding_velocities = self.detect_foot_sliding(
-            q_retarget, contact_sequences[: q_retarget.shape[0]]
+            q_retarget, contact_sequences[: q_retarget.shape[0]], fps
         )
 
         contact_results = self.evaluate_contact_precision(human_joints, object_poses, q_retarget)
@@ -546,11 +549,12 @@ class RetargetingEvaluator:
         smpl_scale = self.constants.ROBOT_HEIGHT / 1.78
         human_joints = np.load(npy_file)[::4] * smpl_scale
 
+        fps = float(np.asarray(rt_res_data.get("fps", 30)).reshape(-1)[0])
         contact_sequences = extract_foot_sticking_sequence_velocity(
-            human_joints, self.demo_joints, ["LeftToeBase", "RightToeBase"]
+            human_joints, self.demo_joints, ["LeftToeBase", "RightToeBase"], fps
         )
         sliding_duration, max_toe_sliding_velocities = self.detect_foot_sliding(
-            q_retarget, contact_sequences[: q_retarget.shape[0]]
+            q_retarget, contact_sequences[: q_retarget.shape[0]], fps
         )
 
         contact_results = self.evaluate_terrain_contact_precision(human_joints, q_retarget)
@@ -623,13 +627,15 @@ class RetargetingEvaluator:
         else:
             raise FileNotFoundError(f"Neither {npy_path} nor {pt_path} found for task {data_name}")
 
+        fps = float(np.asarray(rt_res_data.get("fps", 30)).reshape(-1)[0])
         contact_sequences = extract_foot_sticking_sequence_velocity(
             human_joints,
             demo_joints_for_contact,
             toe_names,
+            fps,
         )
         sliding_duration, max_toe_sliding_velocities = self.detect_foot_sliding(
-            q_retarget, contact_sequences[: q_retarget.shape[0]]
+            q_retarget, contact_sequences[: q_retarget.shape[0]], fps
         )
 
         opt_cost = rt_res_data["cost"]

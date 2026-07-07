@@ -691,7 +691,10 @@ def main(cfg: RetargetingConfig) -> None:
     )
 
     # Extract foot sticking sequences
-    foot_sticking_sequences = extract_foot_sticking_sequence_velocity(human_joints, retargeter.demo_joints, toe_names)
+    motion_fps = 30.0
+    foot_sticking_sequences = extract_foot_sticking_sequence_velocity(
+        human_joints, retargeter.demo_joints, toe_names, motion_fps
+    )
 
     # Task-specific foot sticking adjustments
     if task_type == "object_interaction":
@@ -715,6 +718,7 @@ def main(cfg: RetargetingConfig) -> None:
         q_nominal_list=q_nominal,
         original=not cfg.augmentation,
         dest_res_path=dest_res_path,
+        fps=motion_fps,
     )
     logger.info("Retargeting complete. Results saved to: %s", dest_res_path)
 

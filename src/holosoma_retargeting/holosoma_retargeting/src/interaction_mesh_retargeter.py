@@ -376,6 +376,8 @@ class InteractionMeshRetargeter:
         q_nominal_list=None,
         original=True,
         dest_res_path=None,
+        fps: float = 30.0,
+        run_metadata: dict[str, str | int | float] | None = None,
     ):
         """
         The main function to retarget an entire motion sequence frame by frame.
@@ -407,6 +409,10 @@ class InteractionMeshRetargeter:
         tetrahedra = []
         obj_pts_demo_list = []  # scaled object pts
         obj_pts_list = []  # original size object pts
+        frame_costs: list[float] = []
+        solver_statuses: list[str] = []
+        iteration_counts: list[int] = []
+        frame_runtimes: list[float] = []
 
         print(f"\nStarting motion retargeting for {num_frames} frames...")
 
@@ -460,7 +466,8 @@ class InteractionMeshRetargeter:
                 else:
                     w_nominal_tracking = self.w_nominal_tracking_init * np.exp(-i / self.nominal_tracking_tau)
 
-                q, cost = self.iterate(
+                frame_start = time.perf_counter()
+                q, cost, iterations = self.iterate(
                     q_locked=q_locked_list[i],
                     q_n=q,
                     q_t_last=retargeted_motions[-1],
@@ -474,6 +481,10 @@ class InteractionMeshRetargeter:
                     n_iter=50 if i == 0 else 10,
                     frame_idx=i,
                 )
+                frame_costs.append(float(cost))
+                solver_statuses.append(str(self._last_solver_status))
+                iteration_counts.append(int(iterations))
+                frame_runtimes.append(float(time.perf_counter() - frame_start))
                 if self.debug:
                     robot_link_positions = self._get_robot_link_positions(
                         q, self.laplacian_match_links.values()
@@ -507,13 +518,22 @@ class InteractionMeshRetargeter:
             robot_kpts_handle_list.clear()
 
         # Save results
-        np.savez(
-            dest_res_path,
-            qpos=np.array(retargeted_motions)[1:],
-            human_joints=human_joint_motions,
-            fps=30,
-            cost=cost,
-        )
+        if not np.isfinite(fps) or fps <= 0:
+            raise ValueError(f"fps must be finite and positive, got {fps}")
+        output = {
+            "qpos": np.array(retargeted_motions)[1:],
+            "human_joints": human_joint_motions,
+            "fps": np.asarray(fps, dtype=np.float32),
+            "cost": np.asarray(frame_costs[-1], dtype=np.float64),
+            "frame_cost": np.asarray(frame_costs, dtype=np.float64),
+            "solver_status": np.asarray(solver_statuses),
+            "iteration_count": np.asarray(iteration_counts, dtype=np.int32),
+            "frame_runtime_sec": np.asarray(frame_runtimes, dtype=np.float64),
+            "runtime_sec": np.asarray(sum(frame_runtimes), dtype=np.float64),
+        }
+        if run_metadata:
+            output.update({key: np.asarray(value) for key, value in run_metadata.items()})
+        np.savez(dest_res_path, **output)
         print("Saving results to path:", dest_res_path)
 
         if self.visualize:
@@ -528,7 +548,7 @@ class InteractionMeshRetargeter:
                 viser_object=self.viser_object,
                 object_base_frame=getattr(self, "object_base", None) if self.viser_object else None,
                 contains_object_in_qpos=bool(self.viser_object) and bool(self.has_dynamic_object),
-                initial_fps=30,
+                initial_fps=int(round(fps)),
                 initial_interp_mult=2,
                 loop=False,
             )
@@ -739,6 +759,7 @@ class InteractionMeshRetargeter:
 
         if problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE):
             raise RuntimeError(f"CVXPY solve failed: {problem.status}")
+        self._last_solver_status = str(problem.status)
 
         dqa_star = dqa.value
         cost = problem.value
@@ -833,7 +854,9 @@ class InteractionMeshRetargeter:
     ):
         """Iterate the solver for multiple iterations."""
         last_cost = np.inf
+        iterations = 0
         for _ in range(n_iter):
+            iterations += 1
             q_a_n_last = q_n[self.q_a_indices]
             q_n, cost = self.solve_single_iteration(
                 q_locked=q_locked,
@@ -851,7 +874,7 @@ class InteractionMeshRetargeter:
             if np.isclose(cost, last_cost):
                 break
             last_cost = cost
-        return q_n, cost
+        return q_n, cost, iterations
 
     def _draw_self_collision_geoms(self):
         """Draw collision cylinders for self-collision geom pairs in viser."""

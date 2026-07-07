@@ -239,7 +239,7 @@ def process_single_task(args):
 
         # Extract foot sticking sequences
         foot_sticking_sequences = extract_foot_sticking_sequence_velocity(
-            human_joints, retargeter.demo_joints, toe_names
+            human_joints, retargeter.demo_joints, toe_names, 30.0
         )
 
         # Task-specific foot sticking adjustments
@@ -298,6 +298,7 @@ def process_single_task(args):
             q_nominal_list=q_nominal,
             original=(k == 0),
             dest_res_path=file_name,
+            fps=30.0,
         )
 
 
