@@ -17,6 +17,11 @@ from tqdm import tqdm
 from viser.extras import ViserUrdf  # type: ignore[import-not-found]
 
 from holosoma_retargeting.config_types.retargeter import FootLockConfig, SelfCollisionConfig
+from holosoma_retargeting.src.solver_diagnostics import (
+    SUCCESS_STATUSES,
+    RetargetingSolveError,
+    diagnose_constraint_groups,
+)
 
 # Add src to path for direct execution
 src_path = Path(__file__).parent.parent / "src"
@@ -467,20 +472,31 @@ class InteractionMeshRetargeter:
                     w_nominal_tracking = self.w_nominal_tracking_init * np.exp(-i / self.nominal_tracking_tau)
 
                 frame_start = time.perf_counter()
-                q, cost, iterations = self.iterate(
-                    q_locked=q_locked_list[i],
-                    q_n=q,
-                    q_t_last=retargeted_motions[-1],
-                    target_laplacian=target_laplacian,
-                    adj_list=adj_list,
-                    obj_pts_local=object_points_local,
-                    foot_sticking=foot_sticking_sequences[i],
-                    w_nominal_tracking=w_nominal_tracking,
-                    q_a_nominal=(q_nominal_list[i, self.q_a_indices] if q_nominal_list is not None else None),
-                    init_t=i == 0,
-                    n_iter=50 if i == 0 else 10,
-                    frame_idx=i,
-                )
+                try:
+                    q, cost, iterations = self.iterate(
+                        q_locked=q_locked_list[i],
+                        q_n=q,
+                        q_t_last=retargeted_motions[-1],
+                        target_laplacian=target_laplacian,
+                        adj_list=adj_list,
+                        obj_pts_local=object_points_local,
+                        foot_sticking=foot_sticking_sequences[i],
+                        w_nominal_tracking=w_nominal_tracking,
+                        q_a_nominal=(q_nominal_list[i, self.q_a_indices] if q_nominal_list is not None else None),
+                        init_t=i == 0,
+                        n_iter=50 if i == 0 else 10,
+                        frame_idx=i,
+                    )
+                except RetargetingSolveError as exc:
+                    exc.add_context(
+                        partial_qpos=np.asarray(retargeted_motions[1:], dtype=float),
+                        failing_human_joints=np.asarray(human_joint_motions[i], dtype=float),
+                        failing_mapped_human_joints=np.asarray(human_mapped_joints, dtype=float),
+                        failing_object_pose=np.asarray(object_poses[i], dtype=float),
+                        failing_object_pose_augmented=np.asarray(object_poses_augmented[i], dtype=float),
+                        completed_frames=len(retargeted_motions) - 1,
+                    )
+                    raise
                 frame_costs.append(float(cost))
                 solver_statuses.append(str(self._last_solver_status))
                 iteration_counts.append(int(iterations))
@@ -584,6 +600,7 @@ class InteractionMeshRetargeter:
         verbose=False,
         init_t=False,
         frame_idx: int = 0,
+        sqp_iteration: int = 0,
     ):
         """The main function to solve a single iteration of the DiffIK problem.
         Args:
@@ -640,10 +657,21 @@ class InteractionMeshRetargeter:
         lap_var = cp.Variable(3 * V, name="laplacian")
 
         # Constraints list
-        constraints = []
+        base_constraints: list[cp.Constraint] = []
+        constraint_groups: dict[str, list[cp.Constraint]] = {
+            "foot_sticking": [],
+            "foot_lock": [],
+            "object_ground_collision": [],
+            "self_collision": [],
+            "joint_limits": [],
+            "trust_region": [],
+        }
+        foot_targets: list[dict[str, object]] = []
+        collision_records: list[dict[str, object]] = []
+        self_collision_records: list[dict[str, object]] = []
 
         # Linear equality
-        constraints += [cp.Constant(J_L[:, self.q_a_indices]) @ dqa - lap_var == -lap0_vec]
+        base_constraints.append(cp.Constant(J_L[:, self.q_a_indices]) @ dqa - lap_var == -lap0_vec)
 
         # Foot constraints (sticking + foot lock window Z pinning)
         apply_foot_sticking = (self.q_a_init_idx < 12) and self.activate_foot_sticking
@@ -673,10 +701,18 @@ class InteractionMeshRetargeter:
                         p_ub = p_lb + 2 * self.foot_sticking_tolerance  # symmetric window
 
                         Jxy = J_WF[:2, self.q_a_indices]  # (2 x nq_act)
-                        constraints += [
+                        constraint_groups["foot_sticking"] += [
                             Jxy @ dqa >= p_lb[:2],
                             Jxy @ dqa <= p_ub[:2],
                         ]
+                        foot_targets.append(
+                            {
+                                "link": key,
+                                "kind": "sticking_xy",
+                                "lower": np.asarray(p_lb[:2], dtype=float),
+                                "upper": np.asarray(p_ub[:2], dtype=float),
+                            }
+                        )
 
             # Foot lock windows: pin Z to floor within configured frame ranges
             if apply_foot_lock:
@@ -687,10 +723,18 @@ class InteractionMeshRetargeter:
                     z_anchor = self.foot_lock.z_floor
                     z_delta = z_anchor - p_WF_dict[key][2]
                     Jz = J_WF[2, self.q_a_indices]
-                    constraints += [
+                    constraint_groups["foot_lock"] += [
                         Jz @ dqa >= z_delta - self.foot_lock.tolerance,
                         Jz @ dqa <= z_delta + self.foot_lock.tolerance,
                     ]
+                    foot_targets.append(
+                        {
+                            "link": key,
+                            "kind": "lock_z",
+                            "lower": float(z_delta - self.foot_lock.tolerance),
+                            "upper": float(z_delta + self.foot_lock.tolerance),
+                        }
+                    )
 
         # Non-penetration constraints
         Js, phis = self._update_jacobians_and_phis_from_q(q)
@@ -698,7 +742,10 @@ class InteractionMeshRetargeter:
             Ja_n_full = Js[key]
             Ja_n = Ja_n_full[self.q_a_indices]
             rhs = -phi - self.penetration_tolerance
-            constraints += [Ja_n @ dqa >= rhs]
+            constraint_groups["object_ground_collision"].append(Ja_n @ dqa >= rhs)
+            collision_records.append(
+                {"pair": [int(key[0]), int(key[1])], "phi": float(phi), "rhs": float(rhs)}
+            )
 
         # Self-collision constraints
         Js_sc, phis_sc = self._compute_self_collision_constraints(frame_idx)
@@ -707,17 +754,24 @@ class InteractionMeshRetargeter:
             Ja_n = Ja_n_full[self.q_a_indices]
             # Enforce: new_distance >= tolerance  =>  phi + J @ dqa >= tol
             rhs = self._self_collision_tolerance - phi
-            constraints += [Ja_n @ dqa >= rhs]
+            constraint_groups["self_collision"].append(Ja_n @ dqa >= rhs)
+            self_collision_records.append(
+                {"pair": [int(key[0]), int(key[1])], "phi": float(phi), "rhs": float(rhs)}
+            )
 
         # Joint limits constraints (actuated)
         if self.activate_joint_limits:
-            constraints += [
+            constraint_groups["joint_limits"] += [
                 dqa >= (self.q_a_lb - q_a_n_last),
                 dqa <= (self.q_a_ub - q_a_n_last),
             ]
 
         # Step size constraints (Lorentz cone)
-        constraints += [cp.SOC(self.step_size, dqa)]
+        constraint_groups["trust_region"].append(cp.SOC(self.step_size, dqa))
+
+        constraints = list(base_constraints)
+        for group_constraints in constraint_groups.values():
+            constraints.extend(group_constraints)
 
         # Objective
         obj_terms = []
@@ -752,13 +806,35 @@ class InteractionMeshRetargeter:
         # -------- Solve with Clarabel --------
         solver_kwargs = {"verbose": verbose}
         problem.solve(solver=cp.CLARABEL, **solver_kwargs)
-        if (problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE)) and init_t:
+        if (problem.status not in SUCCESS_STATUSES) and init_t:
             constraints = [c for c in constraints if not isinstance(c, cp.constraints.second_order.SOC)]
+            constraint_groups["trust_region"] = []
             problem = cp.Problem(cp.Minimize(cp.sum(obj_terms)), constraints)
             problem.solve(solver=cp.CLARABEL, **solver_kwargs)
 
-        if problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE):
-            raise RuntimeError(f"CVXPY solve failed: {problem.status}")
+        if problem.status not in SUCCESS_STATUSES:
+            attribution = diagnose_constraint_groups(base_constraints, constraint_groups)
+            diagnostics = {
+                **attribution,
+                "q_current": np.asarray(q, dtype=float),
+                "q_previous_frame": np.asarray(q_t_last, dtype=float),
+                "q_locked": np.asarray(q_locked, dtype=float),
+                "q_actuated_current": np.asarray(q_a_n_last, dtype=float),
+                "joint_lower_margin": np.asarray(q_a_n_last - self.q_a_lb, dtype=float),
+                "joint_upper_margin": np.asarray(self.q_a_ub - q_a_n_last, dtype=float),
+                "foot_sticking": dict(foot_sticking),
+                "foot_targets": foot_targets,
+                "collision_constraints": collision_records,
+                "self_collision_constraints": self_collision_records,
+                "trust_region_radius": float(self.step_size),
+                "q_a_indices": np.asarray(self.q_a_indices, dtype=int),
+            }
+            raise RetargetingSolveError(
+                status=str(problem.status),
+                frame_idx=frame_idx,
+                sqp_iteration=sqp_iteration,
+                diagnostics=diagnostics,
+            )
         self._last_solver_status = str(problem.status)
 
         dqa_star = dqa.value
@@ -855,7 +931,7 @@ class InteractionMeshRetargeter:
         """Iterate the solver for multiple iterations."""
         last_cost = np.inf
         iterations = 0
-        for _ in range(n_iter):
+        for sqp_iteration in range(n_iter):
             iterations += 1
             q_a_n_last = q_n[self.q_a_indices]
             q_n, cost = self.solve_single_iteration(
@@ -870,6 +946,7 @@ class InteractionMeshRetargeter:
                 w_nominal_tracking=w_nominal_tracking,
                 init_t=init_t,
                 frame_idx=frame_idx,
+                sqp_iteration=sqp_iteration,
             )
             if np.isclose(cost, last_cost):
                 break
