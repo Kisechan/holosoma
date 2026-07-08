@@ -67,6 +67,15 @@ class RetargeterConfig:
     penetration_tolerance: float = 0.001
     """Tolerance for penetration when enforcing non-penetration constraints."""
 
+    collision_constraint_mode: str = "hard"
+    """Collision constraint mode: hard or soft."""
+
+    collision_slack_weight: float = 1e6
+    """Penalty weight for elastic collision slack when collision_constraint_mode is soft."""
+
+    collision_max_slack: float | None = None
+    """Optional upper bound for elastic collision slack."""
+
     foot_sticking_tolerance: float = 1e-3
     """Tolerance for foot sticking constraints in x, y."""
 

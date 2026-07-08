@@ -9,6 +9,7 @@ import numpy as np
 
 
 SUCCESS_STATUSES = (cp.OPTIMAL, cp.OPTIMAL_INACCURATE)
+COLLISION_CONSTRAINT_MODES = {"hard", "soft"}
 
 
 class RetargetingSolveError(RuntimeError):
@@ -40,6 +41,57 @@ def constraint_size(constraint: cp.Constraint) -> int:
     if isinstance(constraint, cp.constraints.second_order.SOC):
         return 1
     return int(np.prod(constraint.shape or (1,)))
+
+
+def validate_collision_constraint_mode(mode: str) -> str:
+    """Return a normalized collision constraint mode or raise a stable error."""
+    normalized = str(mode).lower()
+    if normalized not in COLLISION_CONSTRAINT_MODES:
+        raise ValueError(f"collision_constraint_mode must be one of {sorted(COLLISION_CONSTRAINT_MODES)}")
+    return normalized
+
+
+def build_collision_constraint(
+    expr: cp.Expression,
+    rhs: float,
+    mode: str,
+    slack_weight: float,
+    max_slack: float | None = None,
+    name: str = "collision_slack",
+) -> tuple[list[cp.Constraint], cp.Expression | None, cp.Variable | None]:
+    """Build a hard or elastic linearized non-penetration constraint."""
+    normalized = validate_collision_constraint_mode(mode)
+    if normalized == "hard":
+        return [expr >= rhs], None, None
+
+    if slack_weight <= 0:
+        raise ValueError(f"collision_slack_weight must be positive, got {slack_weight}")
+    if max_slack is not None and max_slack < 0:
+        raise ValueError(f"collision_max_slack must be non-negative or None, got {max_slack}")
+
+    slack = cp.Variable(nonneg=True, name=name)
+    constraints: list[cp.Constraint] = [expr + slack >= rhs]
+    if max_slack is not None:
+        constraints.append(slack <= max_slack)
+    return constraints, float(slack_weight) * cp.sum_squares(slack), slack
+
+
+def summarize_slack_variables(slack_variables: dict[str, list[cp.Variable]]) -> dict[str, dict[str, float | int]]:
+    """Summarize solved slack variables by constraint group."""
+    summary: dict[str, dict[str, float | int]] = {}
+    for group, variables in slack_variables.items():
+        values: list[np.ndarray] = []
+        for variable in variables:
+            if variable.value is None:
+                continue
+            values.append(np.asarray(variable.value, dtype=float).reshape(-1))
+        flat = np.concatenate(values) if values else np.zeros(0, dtype=float)
+        summary[group] = {
+            "count": int(len(variables)),
+            "max_slack": float(np.max(flat, initial=0.0)),
+            "sum_slack": float(np.sum(flat)),
+        }
+    return summary
 
 
 def _solve_status(constraints: list[cp.Constraint]) -> str:

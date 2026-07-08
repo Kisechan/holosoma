@@ -20,7 +20,10 @@ from holosoma_retargeting.config_types.retargeter import FootLockConfig, SelfCol
 from holosoma_retargeting.src.solver_diagnostics import (
     SUCCESS_STATUSES,
     RetargetingSolveError,
+    build_collision_constraint,
     diagnose_constraint_groups,
+    summarize_slack_variables,
+    validate_collision_constraint_mode,
 )
 
 # Add src to path for direct execution
@@ -59,6 +62,9 @@ class InteractionMeshRetargeter:
         step_size: float = 0.2,
         collision_detection_threshold: float = 0.1,
         penetration_tolerance: float = 1e-3,
+        collision_constraint_mode: str = "hard",
+        collision_slack_weight: float = 1e6,
+        collision_max_slack: float | None = None,
         foot_sticking_tolerance: float = 1e-3,
         foot_lock: FootLockConfig | None = None,
         self_collision: SelfCollisionConfig | None = None,
@@ -98,6 +104,9 @@ class InteractionMeshRetargeter:
         self.activate_joint_limits = activate_joint_limits
         self.foot_links = dict(zip(task_constants.FOOT_STICKING_LINKS, task_constants.FOOT_STICKING_LINKS))
         self.penetration_tolerance = penetration_tolerance
+        self.collision_constraint_mode = validate_collision_constraint_mode(collision_constraint_mode)
+        self.collision_slack_weight = float(collision_slack_weight)
+        self.collision_max_slack = collision_max_slack
         self.step_size = step_size
         self.visualize = visualize
         self.debug = debug
@@ -114,6 +123,7 @@ class InteractionMeshRetargeter:
         self.foot_sticking_tolerance = foot_sticking_tolerance
         self._init_foot_lock(foot_lock)
         self._self_collision_config = self_collision
+        self._last_collision_slack_summary: dict[str, dict[str, float | int]] = {}
 
         # Setup visualization if requested
         if self.visualize:
@@ -418,6 +428,7 @@ class InteractionMeshRetargeter:
         solver_statuses: list[str] = []
         iteration_counts: list[int] = []
         frame_runtimes: list[float] = []
+        collision_slack_summaries: list[dict[str, dict[str, float | int]]] = []
 
         print(f"\nStarting motion retargeting for {num_frames} frames...")
 
@@ -501,6 +512,7 @@ class InteractionMeshRetargeter:
                 solver_statuses.append(str(self._last_solver_status))
                 iteration_counts.append(int(iterations))
                 frame_runtimes.append(float(time.perf_counter() - frame_start))
+                collision_slack_summaries.append(dict(self._last_collision_slack_summary))
                 if self.debug:
                     robot_link_positions = self._get_robot_link_positions(
                         q, self.laplacian_match_links.values()
@@ -546,7 +558,22 @@ class InteractionMeshRetargeter:
             "iteration_count": np.asarray(iteration_counts, dtype=np.int32),
             "frame_runtime_sec": np.asarray(frame_runtimes, dtype=np.float64),
             "runtime_sec": np.asarray(sum(frame_runtimes), dtype=np.float64),
+            "collision_constraint_mode": np.asarray(self.collision_constraint_mode),
         }
+        for group_name in ("robot_object_collision", "robot_ground_collision"):
+            group_summaries = [summary.get(group_name, {}) for summary in collision_slack_summaries]
+            output[f"{group_name}_active_count"] = np.asarray(
+                [item.get("active_count", 0) for item in group_summaries], dtype=np.int32
+            )
+            output[f"{group_name}_slack_count"] = np.asarray(
+                [item.get("count", 0) for item in group_summaries], dtype=np.int32
+            )
+            output[f"{group_name}_max_slack"] = np.asarray(
+                [item.get("max_slack", 0.0) for item in group_summaries], dtype=np.float64
+            )
+            output[f"{group_name}_sum_slack"] = np.asarray(
+                [item.get("sum_slack", 0.0) for item in group_summaries], dtype=np.float64
+            )
         if run_metadata:
             output.update({key: np.asarray(value) for key, value in run_metadata.items()})
         np.savez(dest_res_path, **output)
@@ -661,13 +688,19 @@ class InteractionMeshRetargeter:
         constraint_groups: dict[str, list[cp.Constraint]] = {
             "foot_sticking": [],
             "foot_lock": [],
-            "object_ground_collision": [],
+            "robot_object_collision": [],
+            "robot_ground_collision": [],
             "self_collision": [],
             "joint_limits": [],
             "trust_region": [],
         }
         foot_targets: list[dict[str, object]] = []
         collision_records: list[dict[str, object]] = []
+        collision_slack_terms: list[cp.Expression] = []
+        collision_slack_variables: dict[str, list[cp.Variable]] = {
+            "robot_object_collision": [],
+            "robot_ground_collision": [],
+        }
         self_collision_records: list[dict[str, object]] = []
 
         # Linear equality
@@ -743,9 +776,27 @@ class InteractionMeshRetargeter:
                 Ja_n_full = Js[key]
                 Ja_n = Ja_n_full[self.q_a_indices]
                 rhs = -phi - self.penetration_tolerance
-                constraint_groups["object_ground_collision"].append(Ja_n @ dqa >= rhs)
+                group_name = self._collision_constraint_group(key)
+                collision_constraints, slack_term, slack_var = build_collision_constraint(
+                    Ja_n @ dqa,
+                    rhs,
+                    mode=self.collision_constraint_mode,
+                    slack_weight=self.collision_slack_weight,
+                    max_slack=self.collision_max_slack,
+                    name=f"{group_name}_slack_{len(collision_slack_variables[group_name])}",
+                )
+                constraint_groups[group_name].extend(collision_constraints)
+                if slack_term is not None:
+                    collision_slack_terms.append(slack_term)
+                if slack_var is not None:
+                    collision_slack_variables[group_name].append(slack_var)
                 collision_records.append(
-                    {"pair": [int(key[0]), int(key[1])], "phi": float(phi), "rhs": float(rhs)}
+                    {
+                        "pair": [int(key[0]), int(key[1])],
+                        "group": group_name,
+                        "phi": float(phi),
+                        "rhs": float(rhs),
+                    }
                 )
 
         # Self-collision constraints
@@ -778,6 +829,7 @@ class InteractionMeshRetargeter:
         obj_terms = []
 
         obj_terms.append(cp.sum_squares(cp.multiply(sqrt_w3, lap_var - target_lap_vec)))
+        obj_terms.extend(collision_slack_terms)
 
         # nominal tracking for selected indices
         if (w_nominal_tracking > 0) and (q_a_nominal is not None):
@@ -826,6 +878,11 @@ class InteractionMeshRetargeter:
                 "foot_sticking": dict(foot_sticking),
                 "foot_targets": foot_targets,
                 "collision_constraints": collision_records,
+                "collision_constraint_mode": self.collision_constraint_mode,
+                "collision_slack_weight": float(self.collision_slack_weight),
+                "collision_max_slack": (
+                    None if self.collision_max_slack is None else float(self.collision_max_slack)
+                ),
                 "self_collision_constraints": self_collision_records,
                 "trust_region_radius": float(self.step_size),
                 "q_a_indices": np.asarray(self.q_a_indices, dtype=int),
@@ -837,6 +894,14 @@ class InteractionMeshRetargeter:
                 diagnostics=diagnostics,
             )
         self._last_solver_status = str(problem.status)
+        self._last_collision_slack_summary = summarize_slack_variables(collision_slack_variables)
+        for group_name in ("robot_object_collision", "robot_ground_collision"):
+            self._last_collision_slack_summary.setdefault(
+                group_name, {"count": 0, "max_slack": 0.0, "sum_slack": 0.0}
+            )
+            self._last_collision_slack_summary[group_name]["active_count"] = int(
+                sum(1 for record in collision_records if record["group"] == group_name)
+            )
 
         dqa_star = dqa.value
         cost = problem.value
@@ -859,6 +924,14 @@ class InteractionMeshRetargeter:
             return False
 
         return any(start <= frame_idx <= end for start, end in self._foot_lock_windows.get(side, ()))
+
+    def _collision_constraint_group(self, pair: tuple[int, int]) -> str:
+        names = [self._geom_names[int(pair[0])], self._geom_names[int(pair[1])]]
+        if any("ground" in name for name in names):
+            return "robot_ground_collision"
+        if any(self.object_name in name for name in names):
+            return "robot_object_collision"
+        return "robot_object_collision"
 
     def _compute_self_collision_constraints(self, frame_idx: int):
         """Compute Jacobians and distances for self-collision body pairs.

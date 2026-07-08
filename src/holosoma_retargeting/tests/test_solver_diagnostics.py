@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import cvxpy as cp
+import numpy as np
+import pytest
 
 from holosoma_retargeting.src.solver_diagnostics import (
     SUCCESS_STATUSES,
     RetargetingSolveError,
+    build_collision_constraint,
     diagnose_constraint_groups,
+    summarize_slack_variables,
 )
 
 
@@ -54,3 +58,35 @@ def test_solve_error_accepts_frame_context() -> None:
     assert error.sqp_iteration == 3
     assert error.diagnostics["completed_frames"] == 12
     assert "frame 12" in str(error)
+
+
+def test_soft_collision_slack_restores_feasibility() -> None:
+    delta = cp.Variable(1)
+    constraints, objective, slack = build_collision_constraint(
+        delta, 1.0, mode="soft", slack_weight=100.0, name="collision_slack"
+    )
+    problem = cp.Problem(cp.Minimize(objective), [delta == 0.0, *constraints])
+    problem.solve(solver=cp.CLARABEL)
+
+    assert _is_success(problem.status)
+    assert slack is not None
+    assert float(np.asarray(slack.value)) >= 0.99
+    summary = summarize_slack_variables({"robot_object_collision": [slack]})
+    assert summary["robot_object_collision"]["max_slack"] >= 0.99
+
+
+def test_hard_collision_keeps_infeasible_conflict() -> None:
+    delta = cp.Variable(1)
+    constraints, objective, slack = build_collision_constraint(delta, 1.0, mode="hard", slack_weight=100.0)
+    problem = cp.Problem(cp.Minimize(0), [delta == 0.0, *constraints])
+    problem.solve(solver=cp.CLARABEL)
+
+    assert problem.status == cp.INFEASIBLE
+    assert objective is None
+    assert slack is None
+
+
+def test_collision_constraint_mode_validation() -> None:
+    delta = cp.Variable(1)
+    with pytest.raises(ValueError, match="collision_constraint_mode"):
+        build_collision_constraint(delta, 1.0, mode="elastic", slack_weight=100.0)
