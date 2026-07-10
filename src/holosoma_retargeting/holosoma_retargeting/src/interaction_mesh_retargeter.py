@@ -16,7 +16,12 @@ from scipy.spatial.transform import Rotation  # type: ignore[import-untyped]
 from tqdm import tqdm
 from viser.extras import ViserUrdf  # type: ignore[import-not-found]
 
-from holosoma_retargeting.config_types.retargeter import FootLockConfig, SelfCollisionConfig
+from holosoma_retargeting.config_types.retargeter import FootLockConfig, PhaseWindowConfig, SelfCollisionConfig
+from holosoma_retargeting.src.phase_window_retargeter import (
+    TEMPORAL_QPOS_INDICES,
+    PhaseWindowResult,
+    refine_temporal_sequence,
+)
 from holosoma_retargeting.src.solver_diagnostics import (
     SUCCESS_STATUSES,
     RetargetingSolveError,
@@ -578,6 +583,85 @@ class InteractionMeshRetargeter:
             output.update({key: np.asarray(value) for key, value in run_metadata.items()})
         np.savez(dest_res_path, **output)
         print("Saving results to path:", dest_res_path)
+
+    def linearize_phase_kinematics(
+        self,
+        qpos: np.ndarray,
+        contact_link_names: tuple[str, ...] = (
+            "left_ankle_roll_sphere_5_link",
+            "right_ankle_roll_sphere_5_link",
+            "left_rubber_hand_link",
+            "right_rubber_hand_link",
+        ),
+    ) -> dict[str, np.ndarray]:
+        """Linearize foot anchors and limb-object contact points around a qpos trajectory."""
+        qpos = np.asarray(qpos, dtype=float)
+        missing = [index for index in TEMPORAL_QPOS_INDICES if index not in self.q_a_indices]
+        if missing:
+            raise ValueError(f"phase refinement requires q_a indices {missing}; use q_a_init_idx=-7")
+        temporal_columns = np.asarray(
+            [int(np.flatnonzero(self.q_a_indices == index)[0]) for index in TEMPORAL_QPOS_INDICES]
+        )
+        foot_names = sorted(
+            self.foot_links,
+            key=lambda name: (0 if "left" in name.lower() else 1, name),
+        )
+        foot_links = {name: self.foot_links[name] for name in foot_names}
+        contact_links = {f"contact_{index}": name for index, name in enumerate(contact_link_names)}
+        foot_positions = np.zeros((len(qpos), len(foot_links), 3), dtype=float)
+        foot_jacobians = np.zeros((len(qpos), len(foot_links), 3, len(TEMPORAL_QPOS_INDICES)), dtype=float)
+        contact_positions = np.zeros((len(qpos), len(contact_links), 3), dtype=float)
+        contact_jacobians = np.zeros((len(qpos), len(contact_links), 3, len(TEMPORAL_QPOS_INDICES)), dtype=float)
+        for frame, configuration in enumerate(qpos):
+            foot_jac, foot_pos, _ = self._calc_manipulator_jacobians(
+                configuration, links=foot_links, obj_frame=False
+            )
+            contact_jac, contact_pos, _ = self._calc_manipulator_jacobians(
+                configuration, links=contact_links, obj_frame=False
+            )
+            for point, name in enumerate(foot_links):
+                foot_positions[frame, point] = foot_pos[name]
+                foot_jacobians[frame, point] = foot_jac[name][:, temporal_columns]
+            for channel, name in enumerate(contact_links):
+                contact_positions[frame, channel] = contact_pos[name]
+                contact_jacobians[frame, channel] = contact_jac[name][:, temporal_columns]
+        return {
+            "foot_positions": foot_positions,
+            "foot_jacobians": foot_jacobians,
+            "foot_sides": np.asarray([0 if "left" in name.lower() else 1 for name in foot_links], dtype=np.int32),
+            "contact_positions": contact_positions,
+            "contact_jacobians": contact_jacobians,
+        }
+
+    def refine_phase_motion(
+        self,
+        initial_qpos: np.ndarray,
+        fps: float,
+        joint_velocity_limits: np.ndarray,
+        *,
+        ground_contact: np.ndarray | None = None,
+        contact_targets: np.ndarray | None = None,
+        contact_weights: np.ndarray | None = None,
+        velocity_scale: np.ndarray | None = None,
+        acceleration_scale: np.ndarray | None = None,
+        config: PhaseWindowConfig | None = None,
+    ) -> PhaseWindowResult:
+        """Run phase-aware temporal refinement using MuJoCo kinematic linearizations."""
+        linearization = self.linearize_phase_kinematics(initial_qpos)
+        joint_columns = np.asarray([int(np.flatnonzero(self.q_a_indices == index)[0]) for index in range(7, 36)])
+        return refine_temporal_sequence(
+            initial_qpos, fps,
+            self.q_a_lb[joint_columns], self.q_a_ub[joint_columns], joint_velocity_limits,
+            velocity_scale=velocity_scale, acceleration_scale=acceleration_scale,
+            ground_contact=ground_contact,
+            foot_positions=linearization["foot_positions"] if ground_contact is not None else None,
+            foot_jacobians=linearization["foot_jacobians"] if ground_contact is not None else None,
+            foot_sides=linearization["foot_sides"] if ground_contact is not None else None,
+            contact_positions=linearization["contact_positions"] if contact_targets is not None else None,
+            contact_jacobians=linearization["contact_jacobians"] if contact_targets is not None else None,
+            contact_targets=contact_targets, contact_weights=contact_weights,
+            config=config,
+        )
 
         if self.visualize:
             robot_dof = len(self.viser_robot.get_actuated_joint_limits())

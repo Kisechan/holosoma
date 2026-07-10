@@ -3,7 +3,14 @@ from __future__ import annotations
 import numpy as np
 
 from holosoma_retargeting.config_types.retargeter import PhaseWindowConfig
-from holosoma_retargeting.src.phase_window_retargeter import receding_windows, refine_temporal_sequence
+from holosoma_retargeting.src.phase_window_retargeter import (
+    CONTACT_ACTIVE,
+    CONTACT_APPROACH,
+    CONTACT_RELEASE,
+    build_contact_phases,
+    receding_windows,
+    refine_temporal_sequence,
+)
 
 
 def _reference(frames: int) -> np.ndarray:
@@ -47,3 +54,37 @@ def test_temporal_refinement_is_fps_invariant() -> None:
         outputs.append(np.interp(np.linspace(0, 1, 31), time, result.qpos[:, 7]))
     np.testing.assert_allclose(outputs[0], outputs[1], atol=1e-2)
     np.testing.assert_allclose(outputs[0], outputs[2], atol=1.5e-2)
+
+
+def test_contact_phase_closes_short_gaps_and_filters_short_runs() -> None:
+    contact = np.zeros((20, 1), dtype=bool)
+    contact[7:9] = True
+    contact[10:14] = True
+    contact[18] = True
+    cleaned, phase, weights = build_contact_phases(contact)
+    assert cleaned[7:14].all()
+    assert not cleaned[18, 0]
+    assert phase[6, 0] == CONTACT_APPROACH
+    assert phase[10, 0] == CONTACT_ACTIVE
+    assert phase[14, 0] == CONTACT_RELEASE
+    assert weights[10, 0] == 1.0
+
+
+def test_foot_anchor_constraints_bound_linearized_sliding() -> None:
+    frames = 8
+    reference = _reference(frames)
+    reference[:, 0] = np.linspace(0.0, 0.2, frames)
+    positions = np.zeros((frames, 2, 3)); positions[:, :, 0] = reference[:, 0, None]
+    jacobians = np.zeros((frames, 2, 3, 32)); jacobians[:, :, 0, 0] = 1.0
+    result = refine_temporal_sequence(
+        reference, 30.0, -np.ones(29), np.ones(29), np.full(29, 20.0),
+        ground_contact=np.ones((frames, 2), dtype=bool), foot_positions=positions,
+        foot_jacobians=jacobians, foot_sides=np.asarray([0, 1]),
+        config=PhaseWindowConfig(
+            window_frames=8, stride_frames=8, trust_radius=0.3,
+            reference_weight=0.1, foot_anchor_weight=1e4,
+        ),
+    )
+    predicted_x = positions[..., 0] + (result.qpos[:, 0] - reference[:, 0])[:, None]
+    assert np.max(np.abs(predicted_x - predicted_x[0])) <= 0.0081
+    assert np.max(result.foot_anchor_cost) < 1e-4
