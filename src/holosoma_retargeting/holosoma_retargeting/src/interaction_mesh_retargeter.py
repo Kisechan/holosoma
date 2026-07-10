@@ -649,6 +649,14 @@ class InteractionMeshRetargeter:
         """Run phase-aware temporal refinement using MuJoCo kinematic linearizations."""
         cfg = config or PhaseWindowConfig()
         linearization = self.linearize_phase_kinematics(initial_qpos)
+        foot_positions = np.stack([
+            linearization["foot_positions"][:, linearization["foot_sides"] == side].mean(axis=1)
+            for side in (0, 1)
+        ], axis=1)
+        foot_jacobians = np.stack([
+            linearization["foot_jacobians"][:, linearization["foot_sides"] == side].mean(axis=1)
+            for side in (0, 1)
+        ], axis=1)
         joint_columns = np.asarray([int(np.flatnonzero(self.q_a_indices == index)[0]) for index in range(7, 36)])
         temporal_columns = np.asarray(
             [int(np.flatnonzero(self.q_a_indices == index)[0]) for index in TEMPORAL_QPOS_INDICES]
@@ -670,9 +678,9 @@ class InteractionMeshRetargeter:
             self.q_a_lb[joint_columns], self.q_a_ub[joint_columns], joint_velocity_limits,
             velocity_scale=velocity_scale, acceleration_scale=acceleration_scale,
             ground_contact=ground_contact,
-            foot_positions=linearization["foot_positions"] if ground_contact is not None else None,
-            foot_jacobians=linearization["foot_jacobians"] if ground_contact is not None else None,
-            foot_sides=linearization["foot_sides"] if ground_contact is not None else None,
+            foot_positions=foot_positions if ground_contact is not None else None,
+            foot_jacobians=foot_jacobians if ground_contact is not None else None,
+            foot_sides=np.asarray([0, 1]) if ground_contact is not None else None,
             contact_positions=linearization["contact_positions"] if contact_targets is not None else None,
             contact_jacobians=linearization["contact_jacobians"] if contact_targets is not None else None,
             contact_targets=contact_targets, contact_weights=contact_weights,
