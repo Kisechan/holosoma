@@ -647,9 +647,25 @@ class InteractionMeshRetargeter:
         config: PhaseWindowConfig | None = None,
     ) -> PhaseWindowResult:
         """Run phase-aware temporal refinement using MuJoCo kinematic linearizations."""
+        cfg = config or PhaseWindowConfig()
         linearization = self.linearize_phase_kinematics(initial_qpos)
         joint_columns = np.asarray([int(np.flatnonzero(self.q_a_indices == index)[0]) for index in range(7, 36)])
-        return refine_temporal_sequence(
+        temporal_columns = np.asarray(
+            [int(np.flatnonzero(self.q_a_indices == index)[0]) for index in TEMPORAL_QPOS_INDICES]
+        )
+        collision_jacobians: list[np.ndarray] = []
+        collision_phis: list[np.ndarray] = []
+        collision_groups: list[np.ndarray] = []
+        for configuration in np.asarray(initial_qpos, dtype=float):
+            jacobians, phis = self._update_jacobians_and_phis_from_q(configuration)
+            records = sorted(phis, key=lambda pair: (self._collision_constraint_group(pair), phis[pair], pair))
+            collision_jacobians.append(
+                np.asarray([jacobians[pair][self.q_a_indices][temporal_columns] for pair in records], dtype=float)
+                if records else np.zeros((0, len(TEMPORAL_QPOS_INDICES)), dtype=float)
+            )
+            collision_phis.append(np.asarray([phis[pair] for pair in records], dtype=float))
+            collision_groups.append(np.asarray([self._collision_constraint_group(pair) for pair in records]))
+        result = refine_temporal_sequence(
             initial_qpos, fps,
             self.q_a_lb[joint_columns], self.q_a_ub[joint_columns], joint_velocity_limits,
             velocity_scale=velocity_scale, acceleration_scale=acceleration_scale,
@@ -660,7 +676,31 @@ class InteractionMeshRetargeter:
             contact_positions=linearization["contact_positions"] if contact_targets is not None else None,
             contact_jacobians=linearization["contact_jacobians"] if contact_targets is not None else None,
             contact_targets=contact_targets, contact_weights=contact_weights,
-            config=config,
+            collision_jacobians=collision_jacobians, collision_phis=collision_phis,
+            collision_groups=collision_groups, penetration_tolerance=self.penetration_tolerance,
+            config=cfg,
+        )
+        actual_penetration = np.zeros(len(result.qpos), dtype=float)
+        active_counts = np.zeros(len(result.qpos), dtype=np.int32)
+        for frame, configuration in enumerate(result.qpos):
+            _, phis = self._update_jacobians_and_phis_from_q(configuration)
+            active_counts[frame] = len(phis)
+            actual_penetration[frame] = max(0.0, max((-float(phi) for phi in phis.values()), default=0.0))
+        if np.max(actual_penetration, initial=0.0) > cfg.collision_recovery_max_slack + 1e-6:
+            frame = int(np.argmax(actual_penetration))
+            raise RetargetingSolveError(
+                status="actual_penetration_exceeds_cap", frame_idx=frame, sqp_iteration=0,
+                diagnostics={
+                    "actual_max_penetration": actual_penetration,
+                    "collision_recovery_max_slack": result.collision_recovery_max_slack,
+                    "partial_qpos": result.qpos[:frame],
+                },
+            )
+        return PhaseWindowResult(
+            result.qpos, result.window_id, result.window_iteration_count,
+            result.velocity_cost, result.acceleration_cost, result.contact_cost,
+            result.foot_anchor_cost, result.collision_recovery_used,
+            result.collision_recovery_max_slack, actual_penetration, active_counts,
         )
 
         if self.visualize:

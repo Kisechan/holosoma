@@ -24,6 +24,10 @@ class PhaseWindowResult:
     acceleration_cost: np.ndarray
     contact_cost: np.ndarray
     foot_anchor_cost: np.ndarray
+    collision_recovery_used: np.ndarray
+    collision_recovery_max_slack: np.ndarray
+    actual_max_penetration: np.ndarray
+    active_collision_pair_count: np.ndarray
 
 
 CONTACT_INACTIVE = 0
@@ -92,6 +96,20 @@ def receding_windows(num_frames: int, window_frames: int, stride_frames: int) ->
     return windows
 
 
+def select_active_collision_indices(phis: np.ndarray, groups: np.ndarray, top_k: int) -> np.ndarray:
+    """Keep every penetrating pair plus the closest top-k pairs in each collision group."""
+    distances = np.asarray(phis, dtype=float).reshape(-1)
+    labels = np.asarray(groups).reshape(-1)
+    if distances.shape != labels.shape:
+        raise ValueError("collision phis and groups must have matching shapes")
+    selected = set(np.flatnonzero(distances < 0).tolist())
+    for group in np.unique(labels):
+        group_indices = np.flatnonzero(labels == group)
+        order = group_indices[np.argsort(distances[group_indices], kind="stable")]
+        selected.update(order[:top_k].tolist())
+    return np.asarray(sorted(selected), dtype=int)
+
+
 def _scale(values: np.ndarray | None, default: float) -> np.ndarray:
     if values is None:
         return np.full(29, default, dtype=float)
@@ -118,6 +136,10 @@ def refine_temporal_sequence(
     contact_jacobians: np.ndarray | None = None,
     contact_targets: np.ndarray | None = None,
     contact_weights: np.ndarray | None = None,
+    collision_jacobians: list[np.ndarray] | None = None,
+    collision_phis: list[np.ndarray] | None = None,
+    collision_groups: list[np.ndarray] | None = None,
+    penetration_tolerance: float = 0.001,
     config: PhaseWindowConfig | None = None,
 ) -> PhaseWindowResult:
     """Refine root translation and 29 joints while preserving quaternion/object trajectories."""
@@ -156,6 +178,21 @@ def refine_temporal_sequence(
             raise ValueError("contact target/weight shape is invalid")
         if contact_jac.shape != (*contact_pos.shape, len(TEMPORAL_QPOS_INDICES)):
             raise ValueError("contact Jacobian shape is invalid")
+    collision_data = None
+    if any(value is not None for value in (collision_jacobians, collision_phis, collision_groups)):
+        if collision_jacobians is None or collision_phis is None or collision_groups is None:
+            raise ValueError("collision Jacobians, phis, and groups are required together")
+        if not (len(collision_jacobians) == len(collision_phis) == len(collision_groups) == len(reference)):
+            raise ValueError("collision data must match the reference frame count")
+        collision_data = []
+        for jacobian, phi, group in zip(collision_jacobians, collision_phis, collision_groups):
+            jacobian = np.asarray(jacobian, dtype=float)
+            phi = np.asarray(phi, dtype=float).reshape(-1)
+            group = np.asarray(group).reshape(-1)
+            if jacobian.shape != (len(phi), len(TEMPORAL_QPOS_INDICES)) or len(group) != len(phi):
+                raise ValueError("collision frame shapes are invalid")
+            selected = select_active_collision_indices(phi, group, cfg.collision_active_top_k)
+            collision_data.append((jacobian[selected], phi[selected], group[selected]))
 
     foot_anchors = None
     if ground is not None and foot_pos is not None and sides is not None:
@@ -173,6 +210,10 @@ def refine_temporal_sequence(
     acceleration_cost = np.zeros(len(reference), dtype=float)
     contact_cost = np.zeros(len(reference), dtype=float)
     foot_anchor_cost = np.zeros(len(reference), dtype=float)
+    collision_recovery_used = np.zeros(len(reference), dtype=bool)
+    collision_recovery_max_slack = np.zeros(len(reference), dtype=float)
+    actual_max_penetration = np.zeros(len(reference), dtype=float)
+    active_collision_pair_count = np.zeros(len(reference), dtype=np.int32)
     for window_index, (start, end, commit_end) in enumerate(
         receding_windows(len(reference), cfg.window_frames, cfg.stride_frames)
     ):
@@ -184,6 +225,7 @@ def refine_temporal_sequence(
             cp.abs(state - window_reference) <= cfg.trust_radius,
         ]
         delta = state - window_reference
+        collision_slacks: list[tuple[int, cp.Variable]] = []
         if len(window_reference) > 1:
             joint_delta = state[1:, TEMPORAL_JOINT_SLICE] - state[:-1, TEMPORAL_JOINT_SLICE]
             constraints.append(cp.abs(joint_delta) <= velocity_limits / fps)
@@ -227,6 +269,16 @@ def refine_temporal_sequence(
                             cfg.contact_velocity_weight * min(weight, float(weights[frame - 1, channel]))
                             * cp.sum_squares(predicted - predicted_contacts[previous_key] - target_delta)
                         )
+        if collision_data is not None:
+            for local_frame, frame in enumerate(range(start, end)):
+                jacobians, phis, _ = collision_data[frame]
+                for pair, (jacobian, phi) in enumerate(zip(jacobians, phis)):
+                    slack = cp.Variable(nonneg=True, name=f"collision_slack_{window_index}_{local_frame}_{pair}")
+                    constraints.extend([
+                        jacobian @ delta[local_frame] + slack >= -float(phi) - penetration_tolerance,
+                    ])
+                    terms.append(cfg.collision_recovery_weight * cp.square(slack))
+                    collision_slacks.append((frame, slack))
         if len(window_reference) > 1:
             joint_velocity = (
                 state[1:, TEMPORAL_JOINT_SLICE] - state[:-1, TEMPORAL_JOINT_SLICE]
@@ -245,8 +297,18 @@ def refine_temporal_sequence(
                 cfg.acceleration_weight
                 * cp.sum_squares(cp.multiply(1.0 / acceleration_norm, joint_acceleration))
             )
-        problem = cp.Problem(cp.Minimize(cp.sum(terms)), constraints)
+        hard_constraints = [*constraints, *(slack == 0 for _, slack in collision_slacks)]
+        problem = cp.Problem(cp.Minimize(cp.sum(terms)), hard_constraints)
         problem.solve(solver=cp.CLARABEL)
+        used_recovery = False
+        if problem.status not in SUCCESS_STATUSES and collision_slacks:
+            recovery_constraints = [
+                *constraints,
+                *(slack <= cfg.collision_recovery_max_slack for _, slack in collision_slacks),
+            ]
+            problem = cp.Problem(cp.Minimize(cp.sum(terms)), recovery_constraints)
+            problem.solve(solver=cp.CLARABEL)
+            used_recovery = problem.status in SUCCESS_STATUSES
         if problem.status not in SUCCESS_STATUSES or state.value is None:
             raise RuntimeError(f"phase window {window_index} solve failed: {problem.status}")
         solved = np.asarray(state.value, dtype=float)
@@ -254,6 +316,15 @@ def refine_temporal_sequence(
         committed = slice(start, commit_end)
         frame_window[committed] = window_index
         frame_iterations[committed] = 1
+        if collision_data is not None:
+            for frame in range(start, commit_end):
+                active_collision_pair_count[frame] = len(collision_data[frame][1])
+                collision_recovery_used[frame] = used_recovery
+            for frame, slack in collision_slacks:
+                if frame < commit_end and slack.value is not None:
+                    collision_recovery_max_slack[frame] = max(
+                        collision_recovery_max_slack[frame], float(np.asarray(slack.value))
+                    )
         if commit_end - start > 1:
             velocity = np.diff(solved[: commit_end - start, TEMPORAL_JOINT_SLICE], axis=0) * fps
             velocity_cost[start + 1:commit_end] = np.mean((velocity / velocity_norm) ** 2, axis=1)
@@ -276,7 +347,12 @@ def refine_temporal_sequence(
             active = (weights[frame] > 0) & np.all(np.isfinite(targets[frame]), axis=1)
             if np.any(active):
                 contact_cost[frame] = float(np.mean(np.square(predicted[frame, active] - targets[frame, active])))
+    if collision_data is not None:
+        for frame, (jacobians, phis, _) in enumerate(collision_data):
+            predicted_distance = phis + jacobians @ final_delta[frame]
+            actual_max_penetration[frame] = max(0.0, float(-np.min(predicted_distance, initial=0.0)))
     return PhaseWindowResult(
         working, frame_window, frame_iterations, velocity_cost, acceleration_cost,
-        contact_cost, foot_anchor_cost,
+        contact_cost, foot_anchor_cost, collision_recovery_used,
+        collision_recovery_max_slack, actual_max_penetration, active_collision_pair_count,
     )

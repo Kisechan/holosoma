@@ -10,6 +10,7 @@ from holosoma_retargeting.src.phase_window_retargeter import (
     build_contact_phases,
     receding_windows,
     refine_temporal_sequence,
+    select_active_collision_indices,
 )
 
 
@@ -88,3 +89,26 @@ def test_foot_anchor_constraints_bound_linearized_sliding() -> None:
     predicted_x = positions[..., 0] + (result.qpos[:, 0] - reference[:, 0])[:, None]
     assert np.max(np.abs(predicted_x - predicted_x[0])) <= 0.0081
     assert np.max(result.foot_anchor_cost) < 1e-4
+
+
+def test_collision_active_set_keeps_penetrating_pairs_and_top_k() -> None:
+    phis = np.asarray([-0.01, 0.04, 0.02, 0.03, 0.01])
+    groups = np.asarray(["object", "object", "object", "ground", "ground"])
+    selected = select_active_collision_indices(phis, groups, top_k=1)
+    np.testing.assert_array_equal(selected, [0, 4])
+
+
+def test_bounded_collision_recovery_restores_small_conflict() -> None:
+    reference = _reference(4)
+    reference[:, 7] = 0.0
+    jacobians = [np.zeros((1, 32)) for _ in range(4)]
+    phis = [np.asarray([-0.004]) for _ in range(4)]
+    groups = [np.asarray(["object"]) for _ in range(4)]
+    result = refine_temporal_sequence(
+        reference, 30.0, -np.ones(29), np.ones(29), np.ones(29),
+        collision_jacobians=jacobians, collision_phis=phis, collision_groups=groups,
+        config=PhaseWindowConfig(window_frames=4, stride_frames=4),
+    )
+    assert result.collision_recovery_used.all()
+    assert np.max(result.collision_recovery_max_slack) >= 0.0029
+    assert np.max(result.collision_recovery_max_slack) <= 0.005 + 1e-8
