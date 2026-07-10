@@ -44,6 +44,44 @@ class SelfCollisionConfig:
 
 
 @dataclass(frozen=True)
+class PhaseWindowConfig:
+    """Configuration for receding-horizon temporal retargeting refinement."""
+
+    window_frames: int = 30
+    stride_frames: int = 15
+    max_iterations: int = 8
+    trust_radius: float = 0.1
+    min_trust_radius: float = 0.0125
+    reference_weight: float = 10.0
+    velocity_weight: float = 1.0
+    acceleration_weight: float = 0.2
+    contact_position_weight: float = 1000.0
+    contact_velocity_weight: float = 100.0
+    foot_anchor_weight: float = 1000.0
+    collision_active_top_k: int = 32
+    collision_recovery_max_slack: float = 0.005
+    collision_recovery_weight: float = 1e6
+    foot_xy_tolerance: float = 0.003
+    foot_slack_limit: float = 0.005
+    foot_z_lower: float = -0.001
+    foot_z_upper: float = 0.003
+
+    def __post_init__(self) -> None:
+        if self.window_frames < 2:
+            raise ValueError("window_frames must be at least 2")
+        if self.stride_frames < 1 or self.stride_frames > self.window_frames:
+            raise ValueError("stride_frames must be in [1, window_frames]")
+        if self.max_iterations < 1:
+            raise ValueError("max_iterations must be positive")
+        if self.min_trust_radius <= 0 or self.trust_radius < self.min_trust_radius:
+            raise ValueError("trust radii must be positive and ordered")
+        if self.collision_active_top_k < 1:
+            raise ValueError("collision_active_top_k must be positive")
+        if self.collision_recovery_max_slack < 0:
+            raise ValueError("collision_recovery_max_slack must be nonnegative")
+
+
+@dataclass(frozen=True)
 class RetargeterConfig:
     """Configuration for retargeter parameters.
 
