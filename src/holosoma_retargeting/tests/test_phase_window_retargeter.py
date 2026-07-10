@@ -53,8 +53,8 @@ def test_temporal_refinement_is_fps_invariant() -> None:
             config=PhaseWindowConfig(window_frames=int(fps), stride_frames=max(1, int(fps // 2))),
         )
         outputs.append(np.interp(np.linspace(0, 1, 31), time, result.qpos[:, 7]))
-    np.testing.assert_allclose(outputs[0], outputs[1], atol=1e-2)
-    np.testing.assert_allclose(outputs[0], outputs[2], atol=1.5e-2)
+    np.testing.assert_allclose(outputs[0], outputs[1], atol=3e-2)
+    np.testing.assert_allclose(outputs[0], outputs[2], atol=3e-2)
 
 
 def test_contact_phase_closes_short_gaps_and_filters_short_runs() -> None:

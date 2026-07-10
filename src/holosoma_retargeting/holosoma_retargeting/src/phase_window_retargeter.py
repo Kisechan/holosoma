@@ -132,6 +132,7 @@ def refine_temporal_sequence(
     foot_positions: np.ndarray | None = None,
     foot_jacobians: np.ndarray | None = None,
     foot_sides: np.ndarray | None = None,
+    foot_anchor_positions: np.ndarray | None = None,
     contact_positions: np.ndarray | None = None,
     contact_jacobians: np.ndarray | None = None,
     contact_targets: np.ndarray | None = None,
@@ -140,6 +141,7 @@ def refine_temporal_sequence(
     collision_phis: list[np.ndarray] | None = None,
     collision_groups: list[np.ndarray] | None = None,
     penetration_tolerance: float = 0.001,
+    tracking_reference: np.ndarray | None = None,
     config: PhaseWindowConfig | None = None,
 ) -> PhaseWindowResult:
     """Refine root translation and 29 joints while preserving quaternion/object trajectories."""
@@ -147,6 +149,9 @@ def refine_temporal_sequence(
     reference = np.asarray(reference_qpos, dtype=float)
     if reference.ndim != 2 or reference.shape[1] < 36 or len(reference) == 0:
         raise ValueError("reference_qpos must have shape (T, >=36) with at least one frame")
+    tracking = reference if tracking_reference is None else np.asarray(tracking_reference, dtype=float)
+    if tracking.shape != reference.shape:
+        raise ValueError("tracking_reference must match reference_qpos shape")
     if not np.isfinite(fps) or fps <= 0:
         raise ValueError(f"fps must be finite and positive, got {fps}")
     lower = np.asarray(joint_lower, dtype=float).reshape(-1)
@@ -194,14 +199,18 @@ def refine_temporal_sequence(
             selected = select_active_collision_indices(phi, group, cfg.collision_active_top_k)
             collision_data.append((jacobian[selected], phi[selected], group[selected]))
 
-    foot_anchors = None
+    provided_anchors = None if foot_anchor_positions is None else np.asarray(foot_anchor_positions, dtype=float)
+    if provided_anchors is not None and (foot_pos is None or provided_anchors.shape != foot_pos.shape):
+        raise ValueError("foot_anchor_positions must match foot_positions")
+    foot_anchors = provided_anchors
     if ground is not None and foot_pos is not None and sides is not None:
-        foot_anchors = np.full_like(foot_pos, np.nan)
-        for point, side in enumerate(sides):
-            starts = np.flatnonzero(ground[:, side] & ~np.r_[False, ground[:-1, side]])
-            ends = np.flatnonzero(ground[:, side] & ~np.r_[ground[1:, side], False])
-            for start, end in zip(starts, ends):
-                foot_anchors[start:end + 1, point] = foot_pos[start, point]
+        if foot_anchors is None:
+            foot_anchors = np.full_like(foot_pos, np.nan)
+            for point, side in enumerate(sides):
+                starts = np.flatnonzero(ground[:, side] & ~np.r_[False, ground[:-1, side]])
+                ends = np.flatnonzero(ground[:, side] & ~np.r_[ground[1:, side], False])
+                for start, end in zip(starts, ends):
+                    foot_anchors[start:end + 1, point] = foot_pos[start, point]
 
     working = reference.copy()
     frame_window = np.full(len(reference), -1, dtype=np.int32)
@@ -218,6 +227,7 @@ def refine_temporal_sequence(
         receding_windows(len(reference), cfg.window_frames, cfg.stride_frames)
     ):
         window_reference = working[start:end, TEMPORAL_QPOS_INDICES]
+        window_tracking = tracking[start:end, TEMPORAL_QPOS_INDICES]
         state = cp.Variable(window_reference.shape, name=f"phase_window_{window_index}")
         constraints: list[cp.Constraint] = [
             state[:, TEMPORAL_JOINT_SLICE] >= lower,
@@ -236,7 +246,7 @@ def refine_temporal_sequence(
                 <= velocity_limits / fps
             )
 
-        terms: list[cp.Expression] = [cfg.reference_weight * cp.sum_squares(state - window_reference)]
+        terms: list[cp.Expression] = [cfg.reference_weight * cp.sum_squares(state - window_tracking)]
         if foot_anchors is not None and foot_pos is not None and foot_jac is not None and sides is not None:
             for local_frame, frame in enumerate(range(start, end)):
                 for point, side in enumerate(sides):

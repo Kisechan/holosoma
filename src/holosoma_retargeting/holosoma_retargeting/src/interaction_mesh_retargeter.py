@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from types import ModuleType
 
@@ -584,6 +585,37 @@ class InteractionMeshRetargeter:
         np.savez(dest_res_path, **output)
         print("Saving results to path:", dest_res_path)
 
+        if self.visualize:
+            robot_dof = len(self.viser_robot.get_actuated_joint_limits())
+            create_motion_control_sliders(
+                server=self.server,
+                viser_robot=self.viser_robot,
+                robot_base_frame=self.robot_base,
+                motion_sequence=np.asarray(retargeted_motions)[1:],
+                robot_dof=robot_dof,
+                viser_object=self.viser_object,
+                object_base_frame=getattr(self, "object_base", None) if self.viser_object else None,
+                contains_object_in_qpos=bool(self.viser_object) and bool(self.has_dynamic_object),
+                initial_fps=int(round(fps)),
+                initial_interp_mult=2,
+                loop=False,
+            )
+            with self.server.gui.add_folder("Visibility"):
+                show_meshes_cb = self.server.gui.add_checkbox("Show meshes", self.viser_robot.show_visual)
+
+                @show_meshes_cb.on_update
+                def _(_):
+                    self.viser_robot.show_visual = show_meshes_cb.value
+                    if self.viser_object is not None:
+                        self.viser_object.show_visual = show_meshes_cb.value
+
+        return (
+            np.array(retargeted_motions)[1:],
+            obj_pts_demo_list,
+            obj_pts_list,
+            tetrahedra,
+        )
+
     def linearize_phase_kinematics(
         self,
         qpos: np.ndarray,
@@ -648,101 +680,110 @@ class InteractionMeshRetargeter:
     ) -> PhaseWindowResult:
         """Run phase-aware temporal refinement using MuJoCo kinematic linearizations."""
         cfg = config or PhaseWindowConfig()
-        linearization = self.linearize_phase_kinematics(initial_qpos)
-        foot_positions = np.stack([
-            linearization["foot_positions"][:, linearization["foot_sides"] == side].mean(axis=1)
-            for side in (0, 1)
-        ], axis=1)
-        foot_jacobians = np.stack([
-            linearization["foot_jacobians"][:, linearization["foot_sides"] == side].mean(axis=1)
-            for side in (0, 1)
-        ], axis=1)
+        current_qpos = np.asarray(initial_qpos, dtype=float).copy()
         joint_columns = np.asarray([int(np.flatnonzero(self.q_a_indices == index)[0]) for index in range(7, 36)])
         temporal_columns = np.asarray(
             [int(np.flatnonzero(self.q_a_indices == index)[0]) for index in TEMPORAL_QPOS_INDICES]
         )
-        collision_jacobians: list[np.ndarray] = []
-        collision_phis: list[np.ndarray] = []
-        collision_groups: list[np.ndarray] = []
-        for configuration in np.asarray(initial_qpos, dtype=float):
-            jacobians, phis = self._update_jacobians_and_phis_from_q(configuration)
-            records = sorted(phis, key=lambda pair: (self._collision_constraint_group(pair), phis[pair], pair))
-            collision_jacobians.append(
-                np.asarray([jacobians[pair][self.q_a_indices][temporal_columns] for pair in records], dtype=float)
-                if records else np.zeros((0, len(TEMPORAL_QPOS_INDICES)), dtype=float)
+        trust_radius = cfg.trust_radius
+        initial_linearization = self.linearize_phase_kinematics(current_qpos)
+        initial_foot_positions = np.stack([
+            initial_linearization["foot_positions"][:, initial_linearization["foot_sides"] == side].mean(axis=1)
+            for side in (0, 1)
+        ], axis=1)
+        fixed_foot_anchors = None
+        if ground_contact is not None:
+            ground = np.asarray(ground_contact, dtype=bool)
+            fixed_foot_anchors = np.full_like(initial_foot_positions, np.nan)
+            for side in (0, 1):
+                starts = np.flatnonzero(ground[:, side] & ~np.r_[False, ground[:-1, side]])
+                ends = np.flatnonzero(ground[:, side] & ~np.r_[ground[1:, side], False])
+                for start, end in zip(starts, ends):
+                    fixed_foot_anchors[start:end + 1, side] = initial_foot_positions[start, side]
+        accumulated_recovery = np.zeros(len(current_qpos), dtype=bool)
+        accumulated_slack = np.zeros(len(current_qpos), dtype=float)
+        result: PhaseWindowResult | None = None
+        actual_penetration = np.zeros(len(current_qpos), dtype=float)
+        active_counts = np.zeros(len(current_qpos), dtype=np.int32)
+        completed_iterations = 0
+        for iteration in range(cfg.max_iterations):
+            completed_iterations = iteration + 1
+            linearization = self.linearize_phase_kinematics(current_qpos)
+            foot_positions = np.stack([
+                linearization["foot_positions"][:, linearization["foot_sides"] == side].mean(axis=1)
+                for side in (0, 1)
+            ], axis=1)
+            foot_jacobians = np.stack([
+                linearization["foot_jacobians"][:, linearization["foot_sides"] == side].mean(axis=1)
+                for side in (0, 1)
+            ], axis=1)
+            collision_jacobians: list[np.ndarray] = []
+            collision_phis: list[np.ndarray] = []
+            collision_groups: list[np.ndarray] = []
+            for configuration in current_qpos:
+                jacobians, phis = self._update_jacobians_and_phis_from_q(configuration)
+                records = sorted(phis, key=lambda pair: (self._collision_constraint_group(pair), phis[pair], pair))
+                collision_jacobians.append(
+                    np.asarray([jacobians[pair][self.q_a_indices][temporal_columns] for pair in records], dtype=float)
+                    if records else np.zeros((0, len(TEMPORAL_QPOS_INDICES)), dtype=float)
+                )
+                collision_phis.append(np.asarray([phis[pair] for pair in records], dtype=float))
+                collision_groups.append(np.asarray([self._collision_constraint_group(pair) for pair in records]))
+            iteration_config = replace(cfg, trust_radius=trust_radius)
+            candidate = refine_temporal_sequence(
+                current_qpos, fps,
+                self.q_a_lb[joint_columns], self.q_a_ub[joint_columns], joint_velocity_limits,
+                velocity_scale=velocity_scale, acceleration_scale=acceleration_scale,
+                ground_contact=ground_contact,
+                foot_positions=foot_positions if ground_contact is not None else None,
+                foot_jacobians=foot_jacobians if ground_contact is not None else None,
+                foot_sides=np.asarray([0, 1]) if ground_contact is not None else None,
+                foot_anchor_positions=fixed_foot_anchors,
+                contact_positions=linearization["contact_positions"] if contact_targets is not None else None,
+                contact_jacobians=linearization["contact_jacobians"] if contact_targets is not None else None,
+                contact_targets=contact_targets, contact_weights=contact_weights,
+                collision_jacobians=collision_jacobians, collision_phis=collision_phis,
+                collision_groups=collision_groups, penetration_tolerance=self.penetration_tolerance,
+                tracking_reference=initial_qpos,
+                config=iteration_config,
             )
-            collision_phis.append(np.asarray([phis[pair] for pair in records], dtype=float))
-            collision_groups.append(np.asarray([self._collision_constraint_group(pair) for pair in records]))
-        result = refine_temporal_sequence(
-            initial_qpos, fps,
-            self.q_a_lb[joint_columns], self.q_a_ub[joint_columns], joint_velocity_limits,
-            velocity_scale=velocity_scale, acceleration_scale=acceleration_scale,
-            ground_contact=ground_contact,
-            foot_positions=foot_positions if ground_contact is not None else None,
-            foot_jacobians=foot_jacobians if ground_contact is not None else None,
-            foot_sides=np.asarray([0, 1]) if ground_contact is not None else None,
-            contact_positions=linearization["contact_positions"] if contact_targets is not None else None,
-            contact_jacobians=linearization["contact_jacobians"] if contact_targets is not None else None,
-            contact_targets=contact_targets, contact_weights=contact_weights,
-            collision_jacobians=collision_jacobians, collision_phis=collision_phis,
-            collision_groups=collision_groups, penetration_tolerance=self.penetration_tolerance,
-            config=cfg,
-        )
-        actual_penetration = np.zeros(len(result.qpos), dtype=float)
-        active_counts = np.zeros(len(result.qpos), dtype=np.int32)
-        for frame, configuration in enumerate(result.qpos):
-            _, phis = self._update_jacobians_and_phis_from_q(configuration)
-            active_counts[frame] = len(phis)
-            actual_penetration[frame] = max(0.0, max((-float(phi) for phi in phis.values()), default=0.0))
+            accumulated_recovery |= candidate.collision_recovery_used
+            accumulated_slack = np.maximum(accumulated_slack, candidate.collision_recovery_max_slack)
+            step_norm = float(np.max(np.abs(
+                candidate.qpos[:, TEMPORAL_QPOS_INDICES] - current_qpos[:, TEMPORAL_QPOS_INDICES]
+            )))
+            current_qpos = candidate.qpos
+            result = candidate
+            for frame, configuration in enumerate(current_qpos):
+                _, phis = self._update_jacobians_and_phis_from_q(configuration)
+                active_counts[frame] = len(phis)
+                actual_penetration[frame] = max(
+                    0.0, max((-float(phi) for phi in phis.values()), default=0.0)
+                )
+            penetration_ok = np.max(actual_penetration, initial=0.0) <= cfg.collision_recovery_max_slack + 1e-6
+            if penetration_ok and step_norm <= 1e-4:
+                break
+            if not penetration_ok:
+                trust_radius = max(cfg.min_trust_radius, trust_radius * 0.5)
+        if result is None:
+            raise RuntimeError("phase refinement produced no SQP result")
         if np.max(actual_penetration, initial=0.0) > cfg.collision_recovery_max_slack + 1e-6:
             frame = int(np.argmax(actual_penetration))
             raise RetargetingSolveError(
-                status="actual_penetration_exceeds_cap", frame_idx=frame, sqp_iteration=0,
+                status="actual_penetration_exceeds_cap", frame_idx=frame,
+                sqp_iteration=completed_iterations - 1,
                 diagnostics={
                     "actual_max_penetration": actual_penetration,
-                    "collision_recovery_max_slack": result.collision_recovery_max_slack,
+                    "collision_recovery_max_slack": accumulated_slack,
                     "partial_qpos": result.qpos[:frame],
                 },
             )
         return PhaseWindowResult(
-            result.qpos, result.window_id, result.window_iteration_count,
+            result.qpos, result.window_id,
+            np.full(len(result.qpos), completed_iterations, dtype=np.int32),
             result.velocity_cost, result.acceleration_cost, result.contact_cost,
-            result.foot_anchor_cost, result.collision_recovery_used,
-            result.collision_recovery_max_slack, actual_penetration, active_counts,
-        )
-
-        if self.visualize:
-            robot_dof = len(self.viser_robot.get_actuated_joint_limits())
-
-            create_motion_control_sliders(
-                server=self.server,
-                viser_robot=self.viser_robot,
-                robot_base_frame=self.robot_base,
-                motion_sequence=np.asarray(retargeted_motions)[1:],
-                robot_dof=robot_dof,
-                viser_object=self.viser_object,
-                object_base_frame=getattr(self, "object_base", None) if self.viser_object else None,
-                contains_object_in_qpos=bool(self.viser_object) and bool(self.has_dynamic_object),
-                initial_fps=int(round(fps)),
-                initial_interp_mult=2,
-                loop=False,
-            )
-
-            # 4) optional: visibility toggle
-            with self.server.gui.add_folder("Visibility"):
-                show_meshes_cb = self.server.gui.add_checkbox("Show meshes", self.viser_robot.show_visual)
-
-                @show_meshes_cb.on_update
-                def _(_):
-                    self.viser_robot.show_visual = show_meshes_cb.value
-                    if self.viser_object is not None:
-                        self.viser_object.show_visual = show_meshes_cb.value
-
-        return (
-            np.array(retargeted_motions)[1:],
-            obj_pts_demo_list,
-            obj_pts_list,
-            tetrahedra,
+            result.foot_anchor_cost, accumulated_recovery,
+            accumulated_slack, actual_penetration, active_counts,
         )
 
     def solve_single_iteration(
