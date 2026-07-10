@@ -248,8 +248,8 @@ def refine_temporal_sequence(
                     constraints.extend([
                         slack <= cfg.foot_slack_limit,
                         cp.abs(predicted[:2] - anchor[:2]) <= cfg.foot_xy_tolerance + slack,
-                        predicted[2] >= cfg.foot_z_lower,
-                        predicted[2] <= cfg.foot_z_upper,
+                        predicted[2] - anchor[2] >= cfg.foot_z_lower,
+                        predicted[2] - anchor[2] <= cfg.foot_z_upper,
                     ])
                     terms.append(cfg.foot_anchor_weight * cp.sum_squares(predicted[:2] - anchor[:2]))
         if contact_pos is not None and contact_jac is not None and targets is not None and weights is not None:

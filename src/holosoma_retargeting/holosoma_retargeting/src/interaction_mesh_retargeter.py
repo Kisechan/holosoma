@@ -590,8 +590,8 @@ class InteractionMeshRetargeter:
         contact_link_names: tuple[str, ...] = (
             "left_ankle_roll_sphere_5_link",
             "right_ankle_roll_sphere_5_link",
-            "left_rubber_hand_link",
-            "right_rubber_hand_link",
+            "left_sphere_hand_link",
+            "right_sphere_hand_link",
         ),
     ) -> dict[str, np.ndarray]:
         """Linearize foot anchors and limb-object contact points around a qpos trajectory."""
