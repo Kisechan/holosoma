@@ -683,7 +683,14 @@ def create_new_scene_xml_file(
     return output_path
 
 
-def extract_foot_sticking_sequence_velocity(smpl_joints, demo_joints, foot_names, fps, velocity_threshold=0.01):
+def extract_foot_sticking_sequence_velocity(
+    smpl_joints,
+    demo_joints,
+    foot_names,
+    velocity_threshold=0.01,
+    *,
+    fps: float | None = None,
+):
     """
     Extract contact sequence from SMPL joint data based on x,y velocity of toe joints.
 
@@ -691,8 +698,10 @@ def extract_foot_sticking_sequence_velocity(smpl_joints, demo_joints, foot_names
         smpl_joints (np.ndarray): SMPL joint positions of shape (T, N, 3).
         demo_joints (list): List of joint names.
         foot_names (list): List of foot joint names [left_foot, right_foot].
-        fps (float): Motion sampling rate in frames per second.
-        velocity_threshold (float): XY speed threshold in metres per second.
+        velocity_threshold (float): XY velocity threshold. Units are m/s when
+            ``fps`` is provided and m/frame for the legacy path.
+        fps (float | None): Sampling rate used to convert displacement per frame
+            into m/s. ``None`` preserves the historical behavior.
 
     Returns:
         list: List of contact dictionaries for each frame.
@@ -705,19 +714,20 @@ def extract_foot_sticking_sequence_velocity(smpl_joints, demo_joints, foot_names
     left_toe_positions = smpl_joints[:, left_toe_idx, :2]
     right_toe_positions = smpl_joints[:, right_toe_idx, :2]
 
-    if not np.isfinite(fps) or fps <= 0:
-        raise ValueError(f"fps must be finite and positive, got {fps}")
-    left_toe_velocity = np.linalg.norm(np.diff(left_toe_positions, axis=0), axis=1) * fps
-    right_toe_velocity = np.linalg.norm(np.diff(right_toe_positions, axis=0), axis=1) * fps
+    left_toe_velocity = np.linalg.norm(np.diff(left_toe_positions, axis=0), axis=1)
+    right_toe_velocity = np.linalg.norm(np.diff(right_toe_positions, axis=0), axis=1)
+
+    if fps is not None:
+        if fps <= 0:
+            raise ValueError("fps must be positive")
+        left_toe_velocity *= float(fps)
+        right_toe_velocity *= float(fps)
 
     left_toe_velocity = np.concatenate([[velocity_threshold + 1], left_toe_velocity])
     right_toe_velocity = np.concatenate([[velocity_threshold + 1], right_toe_velocity])
 
     return [
-        {
-            foot_names[0]: left_toe_velocity[i] <= velocity_threshold,
-            foot_names[1]: right_toe_velocity[i] <= velocity_threshold,
-        }
+        {"L_Toe": left_toe_velocity[i] <= velocity_threshold, "R_Toe": right_toe_velocity[i] <= velocity_threshold}
         for i in range(len(smpl_joints))
     ]
 

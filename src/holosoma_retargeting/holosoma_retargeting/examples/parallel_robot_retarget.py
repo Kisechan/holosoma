@@ -194,6 +194,8 @@ def process_single_task(args):
     augmentations = generate_augmentation_configs(task_type, augmentation)
     print("The number of augmentations: ", len(augmentations))
 
+    retargeter_config = retargeter
+
     for k, aug_config in enumerate(augmentations):
         # Use fresh copies for each iteration
         human_joints = human_joints_original.copy()
@@ -226,7 +228,7 @@ def process_single_task(args):
             )
 
         # Create retargeter
-        retargeter_kwargs = build_retargeter_kwargs_from_config(retargeter, constants, object_urdf_path, task_type)
+        retargeter_kwargs = build_retargeter_kwargs_from_config(retargeter_config, constants, object_urdf_path, task_type)
         retargeter = InteractionMeshRetargeter(**retargeter_kwargs)
 
         # Preprocess motion data
