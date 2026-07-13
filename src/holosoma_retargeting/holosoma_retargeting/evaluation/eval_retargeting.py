@@ -12,6 +12,7 @@ import json
 import os
 import platform
 import sys
+import xml.etree.ElementTree as ET
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -35,12 +36,15 @@ from holosoma_retargeting.config_types.data_type import (  # noqa: E402
 )
 from holosoma_retargeting.config_types.robot import RobotConfig  # noqa: E402
 from holosoma_retargeting.evaluation.metrics import (  # noqa: E402
+    LEGACY_FOOT_SKATING_THRESHOLD_M_PER_FRAME,
     PENETRATION_TOLERANCES_M,
+    STRICT_FOOT_SKATING_THRESHOLD_MPS,
     binary_contact_metrics,
     canonical_config_hash,
     foot_skating_metrics,
     git_commit,
     load_omnicontact_labels,
+    resolve_foot_skating_threshold,
     summarize_penetration_depths,
 )
 from holosoma_retargeting.src.mujoco_utils import _world_mesh_from_geom  # type: ignore[import-not-found]  # noqa: E402
@@ -54,6 +58,23 @@ from holosoma_retargeting.src.utils import (  # type: ignore[import-not-found]  
     transform_points_world_to_local,
     transform_y_up_to_z_up,
 )
+
+
+def _object_mesh_scale_from_scene(scene_xml: str, object_name: str) -> np.ndarray:
+    """Read the effective object mesh scale used by an external MuJoCo scene."""
+    root = ET.parse(scene_xml).getroot()  # noqa: S314 -- local generated MuJoCo asset
+    geom = root.find(f".//geom[@name='{object_name}']")
+    if geom is None or not geom.get("mesh"):
+        raise ValueError(f"scene has no mesh geom named {object_name!r}")
+    mesh = root.find(f".//mesh[@name='{geom.get('mesh')}']")
+    if mesh is None:
+        raise ValueError(f"scene has no mesh asset for {object_name!r}")
+    values = np.fromstring(mesh.get("scale", "1 1 1"), sep=" ", dtype=np.float64)
+    if values.size == 1:
+        values = np.repeat(values, 3)
+    if values.shape != (3,) or np.any(values <= 0) or not np.all(np.isfinite(values)):
+        raise ValueError(f"invalid object mesh scale in {scene_xml}: {mesh.get('scale')!r}")
+    return values
 
 
 def create_task_constants(
@@ -117,6 +138,7 @@ class RetargetingEvaluator:
         constants: SimpleNamespace | None = None,
         metric_mode: Literal["strict", "legacy"] = "strict",
         contact_label_root: Path | None = None,
+        sliding_threshold: float | None = None,
     ):
         """Initialize evaluator with robot and object models."""
         if constants is None:
@@ -137,8 +159,10 @@ class RetargetingEvaluator:
             self.penetration_tolerance = 0.01
             self.contact_threshold = 0.02
 
-        # Foot sliding threshold (velocity in m/s)
-        self.sliding_threshold = 0.01
+        default_threshold, _ = resolve_foot_skating_threshold(metric_mode)
+        self.sliding_threshold = default_threshold if sliding_threshold is None else float(sliding_threshold)
+        if self.sliding_threshold <= 0:
+            raise ValueError("sliding_threshold must be positive")
 
         # Load Mujoco model
         external_scene_xml = getattr(constants, "SCENE_XML_FILE", "")
@@ -184,6 +208,11 @@ class RetargetingEvaluator:
             F = np.asarray(mesh.faces, dtype=np.int32)  # type: ignore[attr-defined]
             if V.size == 0 or F.size == 0:
                 raise ValueError("Empty object mesh")
+
+            if self.has_dynamic_object and external_scene_xml:
+                V = V * _object_mesh_scale_from_scene(
+                    external_scene_xml, self.object_name
+                )[None]
 
             self._obj_V_local = V
             self._obj_F_local = F
@@ -612,6 +641,7 @@ class RetargetingEvaluator:
                     "duration": sliding_duration,
                     "max_velocity": float(np.max(sliding_velocities)) if len(sliding_velocities) else 0.0,
                     "unit": "m_per_frame",
+                    "threshold_m_per_frame": self.sliding_threshold,
                 },
                 "contact": {
                     "available": True,
@@ -847,6 +877,7 @@ def _evaluate_single_task(
     data_type: str,
     metric_mode: Literal["strict", "legacy"],
     contact_label_root: str | None,
+    sliding_threshold: float,
 ):
     robot_config = RobotConfig(**robot_config_kwargs)
     motion_data_config = MotionDataConfig(**motion_data_config_kwargs)
@@ -883,7 +914,12 @@ def _evaluate_single_task(
         )
         constants.SCENE_XML_FILE = new_scene_xml_path
 
-    if data_type == "robot_object" and "sub" in task_name and "_" in task_name:
+    if (
+        data_type == "robot_object"
+        and object_dir is None
+        and "sub" in task_name
+        and "_" in task_name
+    ):
         parts = task_name.split("_")
         omomo_object = parts[1] if len(parts) >= 2 else None
         omomo_mesh = PROJECT_ROOT / "datasets/OMOMO-Dataset/captured_objects" / f"{omomo_object}_cleaned_simplified.obj"
@@ -902,6 +938,7 @@ def _evaluate_single_task(
         constants=constants,
         metric_mode=metric_mode,
         contact_label_root=Path(contact_label_root) if contact_label_root else None,
+        sliding_threshold=sliding_threshold,
     )
     if data_type == "robot_object":
         return task_name, evaluator.evaluate_trajectory(task_name, data_path, input_data_dir)
@@ -951,6 +988,8 @@ class Args:
     object_dir: Path | None = None
     max_workers: int = 1
     metric_mode: Literal["strict", "legacy"] = "strict"
+    strict_sliding_threshold_mps: float = STRICT_FOOT_SKATING_THRESHOLD_MPS
+    legacy_sliding_threshold_m_per_frame: float = LEGACY_FOOT_SKATING_THRESHOLD_M_PER_FRAME
     contact_label_root: Path | None = None
     output: Path | None = None
     dataset: str | None = None
@@ -998,6 +1037,11 @@ def main(cfg: Args) -> None:
 
     robot_config_kwargs = asdict(cfg.robot_config)
     motion_data_config_kwargs = asdict(cfg.motion_data_config)
+    sliding_threshold, sliding_threshold_unit = resolve_foot_skating_threshold(
+        cfg.metric_mode,
+        strict_threshold_mps=cfg.strict_sliding_threshold_mps,
+        legacy_threshold_m_per_frame=cfg.legacy_sliding_threshold_m_per_frame,
+    )
 
     results: Dict[str, Dict[str, Any]] = {}
     max_workers = max(1, cfg.max_workers)
@@ -1008,6 +1052,7 @@ def main(cfg: Args) -> None:
             str(cfg.object_dir) if cfg.object_dir else None,
             cfg.data_type, cfg.metric_mode,
             str(cfg.contact_label_root) if cfg.contact_label_root else None,
+            sliding_threshold,
         )
         for task_name, file_path in zip(task_names, files)
     ]
@@ -1082,7 +1127,10 @@ def main(cfg: Args) -> None:
         "data_type": cfg.data_type,
         "metric_mode": cfg.metric_mode,
         "penetration_tolerances_m": list(PENETRATION_TOLERANCES_M),
-        "sliding_threshold_mps": 0.01,
+        "foot_skating_threshold": sliding_threshold,
+        "foot_skating_threshold_unit": sliding_threshold_unit,
+        "strict_sliding_threshold_mps": cfg.strict_sliding_threshold_mps,
+        "legacy_sliding_threshold_m_per_frame": cfg.legacy_sliding_threshold_m_per_frame,
         "res_dir": str(cfg.res_dir),
         "data_dir": str(cfg.data_dir),
         "contact_label_root": str(cfg.contact_label_root) if cfg.contact_label_root else None,

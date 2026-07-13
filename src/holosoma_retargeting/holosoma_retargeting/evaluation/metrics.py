@@ -12,11 +12,33 @@ import numpy as np
 
 PENETRATION_TOLERANCES_M = (0.0, 0.002, 0.005, 0.010)
 OMNICONTACT_ORDER = ("left_ankle", "right_ankle", "left_wrist", "right_wrist")
+STRICT_FOOT_SKATING_THRESHOLD_MPS = 0.3
+LEGACY_FOOT_SKATING_THRESHOLD_M_PER_FRAME = 0.01
 
 
 def canonical_config_hash(config: dict[str, Any]) -> str:
     payload = json.dumps(config, sort_keys=True, separators=(",", ":"), default=str).encode()
     return hashlib.sha256(payload).hexdigest()
+
+
+def resolve_foot_skating_threshold(
+    metric_mode: str,
+    *,
+    strict_threshold_mps: float = STRICT_FOOT_SKATING_THRESHOLD_MPS,
+    legacy_threshold_m_per_frame: float = LEGACY_FOOT_SKATING_THRESHOLD_M_PER_FRAME,
+) -> tuple[float, str]:
+    """Return the active foot-skating threshold and its physical unit."""
+    if metric_mode == "strict":
+        threshold = float(strict_threshold_mps)
+        unit = "m_per_second"
+    elif metric_mode == "legacy":
+        threshold = float(legacy_threshold_m_per_frame)
+        unit = "m_per_frame"
+    else:
+        raise ValueError(f"unsupported metric mode: {metric_mode}")
+    if threshold <= 0:
+        raise ValueError("foot-skating threshold must be positive")
+    return threshold, unit
 
 
 def git_commit(path: Path) -> str | None:
@@ -33,7 +55,10 @@ def summarize_penetration_depths(
 ) -> dict[str, float]:
     depths = np.asarray(frame_depths_m, dtype=float)
     total = max(int(depths.size), 1)
-    result = {f"tol_{int(round(tol * 1000))}mm": float(np.count_nonzero(depths > tol) / total) for tol in tolerances_m}
+    result = {
+        f"tol_{round(tol * 1000)}mm": float(np.count_nonzero(depths > tol) / total)
+        for tol in tolerances_m
+    }
     positive = depths[depths > 0]
     result.update(
         {
@@ -100,7 +125,12 @@ def binary_contact_metrics(target: np.ndarray, predicted: np.ndarray) -> dict[st
     }
 
 
-def load_omnicontact_labels(root: Path, sequence: str, target_frames: int, target_fps: float) -> tuple[np.ndarray | None, str | None]:
+def load_omnicontact_labels(
+    root: Path,
+    sequence: str,
+    target_frames: int,
+    target_fps: float,
+) -> tuple[np.ndarray | None, str | None]:
     capture_tokens = sequence.split("omnicontact_", 1)
     if len(capture_tokens) != 2:
         return None, "omnicontact capture id missing from sequence name"
