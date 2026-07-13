@@ -28,6 +28,7 @@ import tyro
 src_root = Path(__file__).resolve().parents[2]
 if str(src_root) not in sys.path:
     sys.path.insert(0, str(src_root))
+PROJECT_ROOT = src_root.parents[2]
 from holosoma_retargeting.config_types.data_type import (  # noqa: E402
     SMPLH_DEMO_JOINTS,
     MotionDataConfig,
@@ -868,6 +869,13 @@ def _evaluate_single_task(
             object_asset_xml_path,
         )
         constants.SCENE_XML_FILE = new_scene_xml_path
+
+    if data_type == "robot_object" and "sub" in task_name and "_" in task_name:
+        parts = task_name.split("_")
+        omomo_object = parts[1] if len(parts) >= 2 else None
+        omomo_mesh = PROJECT_ROOT / "datasets/OMOMO-Dataset/captured_objects" / f"{omomo_object}_cleaned_simplified.obj"
+        if omomo_mesh.exists():
+            constants.OBJECT_MESH_FILE = str(omomo_mesh)
 
     object_model_path: str | None = getattr(constants, "OBJECT_URDF_FILE", None)
 

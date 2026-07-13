@@ -101,12 +101,13 @@ def binary_contact_metrics(target: np.ndarray, predicted: np.ndarray) -> dict[st
 
 
 def load_omnicontact_labels(root: Path, sequence: str, target_frames: int, target_fps: float) -> tuple[np.ndarray | None, str | None]:
-    capture_tokens = [token for token in sequence.split("_") if token.isdigit() and len(token) >= 12]
-    if not capture_tokens:
-        return None, "capture id missing from sequence name"
-    matches = list(root.rglob(f"{capture_tokens[0]}*_with_contact.npz"))
+    capture_tokens = sequence.split("omnicontact_", 1)
+    if len(capture_tokens) != 2:
+        return None, "omnicontact capture id missing from sequence name"
+    capture_id = capture_tokens[1].rsplit("_original", 1)[0]
+    matches = list(root.rglob(f"{capture_id}_with_contact.npz"))
     if len(matches) != 1:
-        return None, f"expected one GT file, found {len(matches)}"
+        return None, f"expected one GT file for {capture_id}, found {len(matches)}"
     with np.load(matches[0], allow_pickle=False) as archive:
         if "contact_info" not in archive:
             return None, "contact_info missing"
