@@ -12,9 +12,9 @@ import json
 import os
 import platform
 import sys
-from datetime import datetime, timezone
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Literal, Sequence
@@ -92,9 +92,13 @@ def create_task_constants(
         namespace.SCENE_XML_FILE = namespace.ROBOT_URDF_FILE.replace(".urdf", ".xml")
 
     if object_dir is not None:
+        scene_name = Path(namespace.ROBOT_URDF_FILE).name.replace(
+            ".urdf", f"_w_{namespace.OBJECT_NAME}.xml"
+        )
         namespace.OBJECT_DIR = object_dir
         namespace.OBJECT_URDF_FILE = f"{object_dir}/{namespace.OBJECT_NAME}.urdf"
         namespace.OBJECT_MESH_FILE = f"{object_dir}/{namespace.OBJECT_NAME}.obj"
+        namespace.SCENE_XML_FILE = f"{object_dir}/{scene_name}"
 
     return namespace
 
@@ -137,7 +141,10 @@ class RetargetingEvaluator:
         self.sliding_threshold = 0.01
 
         # Load Mujoco model
-        if self.object_name == "ground":
+        external_scene_xml = getattr(constants, "SCENE_XML_FILE", "")
+        if external_scene_xml:
+            robot_xml_path = external_scene_xml
+        elif self.object_name == "ground":
             robot_xml_path = robot_model_path.replace(".urdf", ".xml")
         elif self.object_name == "multi_boxes":
             robot_xml_path = constants.SCENE_XML_FILE  # type: ignore[attr-defined]
@@ -165,7 +172,11 @@ class RetargetingEvaluator:
 
         self._obj_V_local = np.empty((0, 3), dtype=np.float64)
         self._obj_F_local = np.empty((0, 3), dtype=np.int32)
-        if hasattr(constants, "OBJECT_MESH_FILE") and constants.OBJECT_MESH_FILE and Path(constants.OBJECT_MESH_FILE).exists():
+        if (
+            hasattr(constants, "OBJECT_MESH_FILE")
+            and constants.OBJECT_MESH_FILE
+            and Path(constants.OBJECT_MESH_FILE).exists()
+        ):
             mesh = trimesh.load(constants.OBJECT_MESH_FILE, force="mesh")
             if not isinstance(mesh, trimesh.Trimesh):
                 mesh = trimesh.util.concatenate(tuple(g for g in mesh.geometry.values()))  # type: ignore[attr-defined]
@@ -832,6 +843,7 @@ def _evaluate_single_task(
     robot_config_kwargs: Dict[str, Any],
     motion_data_config_kwargs: Dict[str, Any],
     object_name: str | None,
+    object_dir: str | None,
     data_type: str,
     metric_mode: Literal["strict", "legacy"],
     contact_label_root: str | None,
@@ -843,6 +855,7 @@ def _evaluate_single_task(
         robot_config,
         motion_data_config,
         object_name=object_name,
+        object_dir=object_dir,
     )
 
     if data_type == "robot_terrain":
@@ -935,6 +948,7 @@ class Args:
     robot: str = "g1"  # Use str to allow dynamic robot types
     data_format: str | None = None  # Use str to allow dynamic data formats
     object_name: str | None = None
+    object_dir: Path | None = None
     max_workers: int = 1
     metric_mode: Literal["strict", "legacy"] = "strict"
     contact_label_root: Path | None = None
@@ -987,31 +1001,41 @@ def main(cfg: Args) -> None:
 
     results: Dict[str, Dict[str, Any]] = {}
     max_workers = max(1, cfg.max_workers)
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(
-                _evaluate_single_task,
-                task_name,
-                file_path,
-                str(cfg.data_dir),
-                robot_config_kwargs,
-                motion_data_config_kwargs,
-                object_name,
-                cfg.data_type,
-                cfg.metric_mode,
-                str(cfg.contact_label_root) if cfg.contact_label_root else None,
-            ): task_name
-            for task_name, file_path in zip(task_names, files)
-        }
-        for fut in as_completed(futures):
+    worker_args = [
+        (
+            task_name, file_path, str(cfg.data_dir), robot_config_kwargs,
+            motion_data_config_kwargs, object_name,
+            str(cfg.object_dir) if cfg.object_dir else None,
+            cfg.data_type, cfg.metric_mode,
+            str(cfg.contact_label_root) if cfg.contact_label_root else None,
+        )
+        for task_name, file_path in zip(task_names, files)
+    ]
+    if max_workers == 1:
+        for task_name, args in zip(task_names, worker_args):
             try:
-                task_name, res = fut.result()
-                if res is None:
-                    results[task_name] = {"retarget_success": False, "error": "trajectory could not be loaded"}
-                else:
-                    results[task_name] = {"retarget_success": True, **res}
-            except Exception as exc:
+                _, res = _evaluate_single_task(*args)
+                results[task_name] = (
+                    {"retarget_success": False, "error": "trajectory could not be loaded"}
+                    if res is None else {"retarget_success": True, **res}
+                )
+            except Exception as exc:  # noqa: PERF203 -- isolate each sequence failure
                 results[task_name] = {"retarget_success": False, "error": f"{type(exc).__name__}: {exc}"}
+    else:
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(_evaluate_single_task, *args): task_name
+                for task_name, args in zip(task_names, worker_args)
+            }
+            for fut in as_completed(futures):
+                try:
+                    task_name, res = fut.result()
+                    if res is None:
+                        results[task_name] = {"retarget_success": False, "error": "trajectory could not be loaded"}
+                    else:
+                        results[task_name] = {"retarget_success": True, **res}
+                except Exception as exc:  # noqa: PERF203 -- isolate each sequence failure
+                    results[task_name] = {"retarget_success": False, "error": f"{type(exc).__name__}: {exc}"}
 
     file_by_task = dict(zip(task_names, files))
     records = []
@@ -1022,7 +1046,7 @@ def main(cfg: Args) -> None:
         fps = None
         try:
             with np.load(output_path, allow_pickle=True) as archive:
-                frames = int(len(archive["qpos"]))
+                frames = len(archive["qpos"])
                 fps = float(np.asarray(archive.get("fps", 30.0)).reshape(-1)[0])
         except (OSError, KeyError, ValueError):
             pass
@@ -1031,9 +1055,9 @@ def main(cfg: Args) -> None:
         expected_frames = None
         try:
             if source_path.suffix == ".npy":
-                expected_frames = int(len(np.load(source_path, mmap_mode="r")))
+                expected_frames = len(np.load(source_path, mmap_mode="r"))
             elif source_path.suffix == ".pt":
-                expected_frames = int(len(load_intermimic_data(str(source_path))[0]))
+                expected_frames = len(load_intermimic_data(str(source_path))[0])
         except (OSError, ValueError, RuntimeError):
             pass
         completed_ratio = (
