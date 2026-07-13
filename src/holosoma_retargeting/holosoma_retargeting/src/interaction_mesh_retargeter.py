@@ -27,9 +27,12 @@ from holosoma_retargeting.src.solver_diagnostics import (
     SUCCESS_STATUSES,
     RetargetingSolveError,
     build_collision_constraint,
+    build_interval_constraint,
     diagnose_constraint_groups,
     summarize_slack_variables,
+    update_trust_region,
     validate_collision_constraint_mode,
+    validate_feasibility_recovery_mode,
 )
 
 # Add src to path for direct execution
@@ -71,6 +74,17 @@ class InteractionMeshRetargeter:
         collision_constraint_mode: str = "hard",
         collision_slack_weight: float = 1e6,
         collision_max_slack: float | None = None,
+        feasibility_recovery_mode: str = "off",
+        restoration_collision_slack_weight: float = 1e6,
+        restoration_foot_slack_weight: float = 1e5,
+        restoration_collision_max_slack: float | None = None,
+        restoration_foot_max_slack: float | None = None,
+        restoration_max_steps: int = 1,
+        adaptive_min_step_size: float = 0.025,
+        adaptive_max_step_size: float = 0.4,
+        adaptive_shrink_factor: float = 0.5,
+        adaptive_grow_factor: float = 1.25,
+        initial_unbounded_retry: bool = True,
         foot_sticking_tolerance: float = 1e-3,
         foot_lock: FootLockConfig | None = None,
         self_collision: SelfCollisionConfig | None = None,
@@ -113,7 +127,23 @@ class InteractionMeshRetargeter:
         self.collision_constraint_mode = validate_collision_constraint_mode(collision_constraint_mode)
         self.collision_slack_weight = float(collision_slack_weight)
         self.collision_max_slack = collision_max_slack
-        self.step_size = step_size
+        self.step_size = float(step_size)
+        self._configured_step_size = float(step_size)
+        self.feasibility_recovery_mode = validate_feasibility_recovery_mode(feasibility_recovery_mode)
+        self.restoration_collision_slack_weight = float(restoration_collision_slack_weight)
+        self.restoration_foot_slack_weight = float(restoration_foot_slack_weight)
+        self.restoration_collision_max_slack = restoration_collision_max_slack
+        self.restoration_foot_max_slack = restoration_foot_max_slack
+        self.restoration_max_steps = int(restoration_max_steps)
+        if self.restoration_max_steps < 1:
+            raise ValueError("restoration_max_steps must be positive")
+        self.adaptive_min_step_size = float(adaptive_min_step_size)
+        self.adaptive_max_step_size = float(adaptive_max_step_size)
+        self.adaptive_shrink_factor = float(adaptive_shrink_factor)
+        self.adaptive_grow_factor = float(adaptive_grow_factor)
+        self.initial_unbounded_retry = bool(initial_unbounded_retry)
+        if not 0 < self.adaptive_min_step_size <= self.step_size <= self.adaptive_max_step_size:
+            raise ValueError("adaptive trust radii must satisfy min <= step_size <= max")
         self.visualize = visualize
         self.debug = debug
         self.demo_joints = task_constants.DEMO_JOINTS
@@ -130,6 +160,11 @@ class InteractionMeshRetargeter:
         self._init_foot_lock(foot_lock)
         self._self_collision_config = self_collision
         self._last_collision_slack_summary: dict[str, dict[str, float | int]] = {}
+        self._last_restoration_slack_summary: dict[str, dict[str, float | int]] = {}
+        self._last_restoration_used = False
+        self._last_restoration_attempt_count = 0
+        self._last_predicted_residual = 0.0
+        self._last_actual_residual = 0.0
 
         # Setup visualization if requested
         if self.visualize:
@@ -420,6 +455,7 @@ class InteractionMeshRetargeter:
             tuple: (retargeted_motions, obj_pts_demo_list, obj_pts_list, tetrahedra)
         """
         num_frames = human_joint_motions.shape[0]
+        self.step_size = self._configured_step_size
         if q_nominal_list is not None:
             q_locked_list = q_nominal_list
         else:
@@ -438,6 +474,12 @@ class InteractionMeshRetargeter:
         iteration_counts: list[int] = []
         frame_runtimes: list[float] = []
         collision_slack_summaries: list[dict[str, dict[str, float | int]]] = []
+        restoration_slack_summaries: list[dict[str, dict[str, float | int]]] = []
+        restoration_used: list[bool] = []
+        restoration_attempt_counts: list[int] = []
+        trust_region_radii: list[float] = []
+        predicted_residuals: list[float] = []
+        actual_residuals: list[float] = []
 
         print(f"\nStarting motion retargeting for {num_frames} frames...")
 
@@ -516,6 +558,7 @@ class InteractionMeshRetargeter:
                         failing_object_pose_augmented=np.asarray(object_poses_augmented[i], dtype=float),
                         completed_frames=len(retargeted_motions) - 1,
                         total_frames=num_frames,
+                        fps=float(fps),
                     )
                     raise
                 frame_costs.append(float(cost))
@@ -523,6 +566,22 @@ class InteractionMeshRetargeter:
                 iteration_counts.append(int(iterations))
                 frame_runtimes.append(float(time.perf_counter() - frame_start))
                 collision_slack_summaries.append(dict(self._last_collision_slack_summary))
+                restoration_slack_summaries.append(dict(self._last_restoration_slack_summary))
+                restoration_used.append(bool(self._last_restoration_used))
+                restoration_attempt_counts.append(int(self._last_restoration_attempt_count))
+                trust_region_radii.append(float(self.step_size))
+                predicted_residuals.append(float(self._last_predicted_residual))
+                actual_residuals.append(float(self._last_actual_residual))
+                if self.feasibility_recovery_mode == "adaptive":
+                    self.step_size = update_trust_region(
+                        radius=self.step_size,
+                        predicted_residual=self._last_predicted_residual,
+                        actual_residual=self._last_actual_residual,
+                        min_radius=self.adaptive_min_step_size,
+                        max_radius=self.adaptive_max_step_size,
+                        shrink_factor=self.adaptive_shrink_factor,
+                        grow_factor=self.adaptive_grow_factor,
+                    )
                 if self.debug:
                     robot_link_positions = self._get_robot_link_positions(
                         q, self.laplacian_match_links.values()
@@ -569,6 +628,13 @@ class InteractionMeshRetargeter:
             "frame_runtime_sec": np.asarray(frame_runtimes, dtype=np.float64),
             "runtime_sec": np.asarray(sum(frame_runtimes), dtype=np.float64),
             "collision_constraint_mode": np.asarray(self.collision_constraint_mode),
+            "feasibility_recovery_mode": np.asarray(self.feasibility_recovery_mode),
+            "restoration_used": np.asarray(restoration_used, dtype=bool),
+            "restoration_attempt_count": np.asarray(restoration_attempt_counts, dtype=np.int32),
+            "restored_frame_ratio": np.asarray(np.mean(restoration_used) if restoration_used else 0.0),
+            "trust_region_radius": np.asarray(trust_region_radii, dtype=np.float64),
+            "predicted_constraint_residual": np.asarray(predicted_residuals, dtype=np.float64),
+            "actual_constraint_residual": np.asarray(actual_residuals, dtype=np.float64),
         }
         for group_name in ("robot_object_collision", "robot_ground_collision"):
             group_summaries = [summary.get(group_name, {}) for summary in collision_slack_summaries]
@@ -583,6 +649,14 @@ class InteractionMeshRetargeter:
             )
             output[f"{group_name}_sum_slack"] = np.asarray(
                 [item.get("sum_slack", 0.0) for item in group_summaries], dtype=np.float64
+            )
+        for group_name in ("robot_object_collision", "robot_ground_collision", "foot_sticking"):
+            group_summaries = [summary.get(group_name, {}) for summary in restoration_slack_summaries]
+            output[f"restoration_{group_name}_max_slack"] = np.asarray(
+                [item.get("max_slack", 0.0) for item in group_summaries], dtype=np.float64
+            )
+            output[f"restoration_{group_name}_mean_slack"] = np.asarray(
+                [item.get("mean_slack", 0.0) for item in group_summaries], dtype=np.float64
             )
         if run_metadata:
             output.update({key: np.asarray(value) for key, value in run_metadata.items()})
@@ -600,7 +674,7 @@ class InteractionMeshRetargeter:
                 viser_object=self.viser_object,
                 object_base_frame=getattr(self, "object_base", None) if self.viser_object else None,
                 contains_object_in_qpos=bool(self.viser_object) and bool(self.has_dynamic_object),
-                initial_fps=int(round(fps)),
+                initial_fps=round(fps),
                 initial_interp_mult=2,
                 loop=False,
             )
@@ -805,6 +879,7 @@ class InteractionMeshRetargeter:
         init_t=False,
         frame_idx: int = 0,
         sqp_iteration: int = 0,
+        restoration: bool = False,
     ):
         """The main function to solve a single iteration of the DiffIK problem.
         Args:
@@ -877,6 +952,7 @@ class InteractionMeshRetargeter:
         collision_slack_variables: dict[str, list[cp.Variable]] = {
             "robot_object_collision": [],
             "robot_ground_collision": [],
+            "foot_sticking": [],
         }
         self_collision_records: list[dict[str, object]] = []
 
@@ -911,14 +987,25 @@ class InteractionMeshRetargeter:
                         p_ub = p_lb + 2 * self.foot_sticking_tolerance  # symmetric window
 
                         Jxy = J_WF[:2, self.q_a_indices]  # (2 x nq_act)
-                        constraint_groups["foot_sticking"] += [
-                            Jxy @ dqa >= p_lb[:2],
-                            Jxy @ dqa <= p_ub[:2],
-                        ]
+                        foot_constraints, foot_slack_term, foot_slack_var = build_interval_constraint(
+                            Jxy @ dqa,
+                            np.asarray(p_lb[:2], dtype=float),
+                            np.asarray(p_ub[:2], dtype=float),
+                            mode="soft" if restoration else "hard",
+                            slack_weight=self.restoration_foot_slack_weight,
+                            max_slack=self.restoration_foot_max_slack,
+                            name=f"foot_sticking_slack_{len(collision_slack_variables['foot_sticking'])}",
+                        )
+                        constraint_groups["foot_sticking"].extend(foot_constraints)
+                        if foot_slack_term is not None:
+                            collision_slack_terms.append(foot_slack_term)
+                        if foot_slack_var is not None:
+                            collision_slack_variables["foot_sticking"].append(foot_slack_var)
                         foot_targets.append(
                             {
                                 "link": key,
                                 "kind": "sticking_xy",
+                                "current": np.asarray(p_WF_dict[key][:2], dtype=float),
                                 "lower": np.asarray(p_lb[:2], dtype=float),
                                 "upper": np.asarray(p_ub[:2], dtype=float),
                             }
@@ -957,9 +1044,11 @@ class InteractionMeshRetargeter:
                 collision_constraints, slack_term, slack_var = build_collision_constraint(
                     Ja_n @ dqa,
                     rhs,
-                    mode=self.collision_constraint_mode,
-                    slack_weight=self.collision_slack_weight,
-                    max_slack=self.collision_max_slack,
+                    mode="soft" if restoration else self.collision_constraint_mode,
+                    slack_weight=(
+                        self.restoration_collision_slack_weight if restoration else self.collision_slack_weight
+                    ),
+                    max_slack=(self.restoration_collision_max_slack if restoration else self.collision_max_slack),
                     name=f"{group_name}_slack_{len(collision_slack_variables[group_name])}",
                 )
                 constraint_groups[group_name].extend(collision_constraints)
@@ -1037,9 +1126,11 @@ class InteractionMeshRetargeter:
         # -------- Solve with Clarabel --------
         solver_kwargs = {"verbose": verbose}
         problem.solve(solver=cp.CLARABEL, **solver_kwargs)
-        if (problem.status not in SUCCESS_STATUSES) and init_t:
+        trust_region_removed_on_retry = False
+        if (problem.status not in SUCCESS_STATUSES) and init_t and self.initial_unbounded_retry and not restoration:
             constraints = [c for c in constraints if not isinstance(c, cp.constraints.second_order.SOC)]
             constraint_groups["trust_region"] = []
+            trust_region_removed_on_retry = True
             problem = cp.Problem(cp.Minimize(cp.sum(obj_terms)), constraints)
             problem.solve(solver=cp.CLARABEL, **solver_kwargs)
 
@@ -1061,24 +1152,45 @@ class InteractionMeshRetargeter:
                 foot_residuals.extend(np.maximum(lower, 0.0).tolist())
                 foot_residuals.extend(np.maximum(-upper, 0.0).tolist())
             collision_residuals = [max(0.0, float(record["rhs"])) for record in collision_records]
+            collision_residuals_by_group = {
+                group: [
+                    max(0.0, float(record["rhs"]))
+                    for record in collision_records if record["group"] == group
+                ]
+                for group in ("robot_object_collision", "robot_ground_collision")
+            }
+            foot_lock_residuals: list[float] = []
+            for target in foot_targets:
+                if target["kind"] != "lock_z":
+                    continue
+                foot_lock_residuals.append(max(0.0, float(target["lower"])))
+                foot_lock_residuals.append(max(0.0, -float(target["upper"])))
+            self_collision_residuals = [
+                max(0.0, float(record["rhs"])) for record in self_collision_records
+            ]
+            joint_residuals = np.concatenate(
+                [np.maximum(-joint_lower_margin, 0.0), np.maximum(-joint_upper_margin, 0.0)]
+            )
+
+            def _residual_summary(values) -> dict[str, float]:
+                array = np.asarray(values, dtype=float).reshape(-1)
+                return {
+                    "max": float(np.max(array, initial=0.0)),
+                    "mean": float(np.mean(array)) if array.size else 0.0,
+                }
+
             group_residual_at_zero = {
-                "collision": {
-                    "max": float(np.max(collision_residuals, initial=0.0)),
-                    "mean": float(np.mean(collision_residuals)) if collision_residuals else 0.0,
-                },
-                "foot_sticking": {
-                    "max": float(np.max(foot_residuals, initial=0.0)),
-                    "mean": float(np.mean(foot_residuals)) if foot_residuals else 0.0,
-                },
-                "joint_limits": {
-                    "max": float(
-                        max(
-                            np.max(-joint_lower_margin, initial=0.0),
-                            np.max(-joint_upper_margin, initial=0.0),
-                        )
-                    ),
-                    "mean": 0.0,
-                },
+                "robot_object_collision": _residual_summary(
+                    collision_residuals_by_group["robot_object_collision"]
+                ),
+                "robot_ground_collision": _residual_summary(
+                    collision_residuals_by_group["robot_ground_collision"]
+                ),
+                "collision": _residual_summary(collision_residuals),
+                "foot_sticking": _residual_summary(foot_residuals),
+                "foot_lock": _residual_summary(foot_lock_residuals),
+                "self_collision": _residual_summary(self_collision_residuals),
+                "joint_limits": _residual_summary(joint_residuals),
                 "trust_region": {"max": 0.0, "mean": 0.0},
             }
             diagnostics = {
@@ -1094,6 +1206,14 @@ class InteractionMeshRetargeter:
                 "foot_sticking": dict(foot_sticking),
                 "foot_targets": foot_targets,
                 "collision_constraints": collision_records,
+                "active_collision_pair_count": len(collision_records),
+                "active_collision_pair_count_by_group": {
+                    name: int(sum(record["group"] == name for record in collision_records))
+                    for name in ("robot_object_collision", "robot_ground_collision")
+                },
+                "foot_sticking_constraint_count": int(
+                    attribution["constraint_group_counts"].get("foot_sticking", 0)
+                ),
                 "collision_constraint_mode": self.collision_constraint_mode,
                 "collision_slack_weight": float(self.collision_slack_weight),
                 "collision_max_slack": (
@@ -1101,6 +1221,9 @@ class InteractionMeshRetargeter:
                 ),
                 "self_collision_constraints": self_collision_records,
                 "trust_region_radius": float(self.step_size),
+                "effective_trust_region_radius": None if trust_region_removed_on_retry else float(self.step_size),
+                "trust_region_removed_on_retry": trust_region_removed_on_retry,
+                "restoration": bool(restoration),
                 "group_residual_at_zero_step": group_residual_at_zero,
                 "q_a_indices": np.asarray(self.q_a_indices, dtype=int),
             }
@@ -1111,12 +1234,17 @@ class InteractionMeshRetargeter:
                 diagnostics=diagnostics,
             )
         self._last_solver_status = str(problem.status)
-        self._last_collision_slack_summary = summarize_slack_variables(collision_slack_variables)
+        solved_slack_summary = summarize_slack_variables(collision_slack_variables)
+        if restoration:
+            self._last_restoration_slack_summary = solved_slack_summary
+        else:
+            self._last_collision_slack_summary = solved_slack_summary
         for group_name in ("robot_object_collision", "robot_ground_collision"):
-            self._last_collision_slack_summary.setdefault(
+            target_summary = self._last_restoration_slack_summary if restoration else self._last_collision_slack_summary
+            target_summary.setdefault(
                 group_name, {"count": 0, "max_slack": 0.0, "sum_slack": 0.0}
             )
-            self._last_collision_slack_summary[group_name]["active_count"] = int(
+            target_summary[group_name]["active_count"] = int(
                 sum(1 for record in collision_records if record["group"] == group_name)
             )
 
@@ -1126,6 +1254,35 @@ class InteractionMeshRetargeter:
         q_star = np.copy(q)
         q_star[self.q_a_indices] = dqa_star + q_a_n_last
         q_star[3:7] /= np.linalg.norm(q_star[3:7]) + 1e-12
+
+        predicted_values = [
+            np.max(np.asarray(constraint.violation(), dtype=float), initial=0.0)
+            for constraints_in_group in constraint_groups.values()
+            for constraint in constraints_in_group
+        ]
+        self._last_predicted_residual = float(np.max(predicted_values, initial=0.0))
+        actual_collision_residual = 0.0
+        if self.activate_obj_non_penetration:
+            _, actual_phis = self._update_jacobians_and_phis_from_q(q_star)
+            actual_collision_residual = float(
+                np.max(
+                    [max(0.0, -float(phi) - self.penetration_tolerance) for phi in actual_phis.values()],
+                    initial=0.0,
+                )
+            )
+        actual_foot_residual = 0.0
+        sticking_targets = [target for target in foot_targets if target["kind"] == "sticking_xy"]
+        if sticking_targets:
+            _, new_foot_positions, _ = self._calc_manipulator_jacobians(
+                q_star, links=self.foot_links, obj_frame=False
+            )
+            violations: list[float] = []
+            for target in sticking_targets:
+                step = np.asarray(new_foot_positions[str(target["link"])][:2]) - np.asarray(target["current"])
+                violations.extend(np.maximum(np.asarray(target["lower"]) - step, 0.0).tolist())
+                violations.extend(np.maximum(step - np.asarray(target["upper"]), 0.0).tolist())
+            actual_foot_residual = float(np.max(violations, initial=0.0))
+        self._last_actual_residual = max(actual_collision_residual, actual_foot_residual)
 
         return q_star, cost
 
@@ -1222,23 +1379,60 @@ class InteractionMeshRetargeter:
         """Iterate the solver for multiple iterations."""
         last_cost = np.inf
         iterations = 0
+        self._last_restoration_used = False
+        self._last_restoration_attempt_count = 0
+        self._last_restoration_slack_summary = {}
         for sqp_iteration in range(n_iter):
             iterations += 1
             q_a_n_last = q_n[self.q_a_indices]
-            q_n, cost = self.solve_single_iteration(
-                q_locked=q_locked,
-                q_a_n_last=q_a_n_last,
-                q_t_last=q_t_last,
-                target_laplacian=target_laplacian,
-                adj_list=adj_list,
-                obj_pts_local=obj_pts_local,
-                foot_sticking=foot_sticking,
-                q_a_nominal=q_a_nominal,
-                w_nominal_tracking=w_nominal_tracking,
-                init_t=init_t,
-                frame_idx=frame_idx,
-                sqp_iteration=sqp_iteration,
-            )
+            solve_kwargs = {
+                "q_locked": q_locked,
+                "q_t_last": q_t_last,
+                "target_laplacian": target_laplacian,
+                "adj_list": adj_list,
+                "obj_pts_local": obj_pts_local,
+                "foot_sticking": foot_sticking,
+                "q_a_nominal": q_a_nominal,
+                "w_nominal_tracking": w_nominal_tracking,
+                "init_t": init_t,
+                "frame_idx": frame_idx,
+                "sqp_iteration": sqp_iteration,
+            }
+            try:
+                q_n, cost = self.solve_single_iteration(q_a_n_last=q_a_n_last, **solve_kwargs)
+            except RetargetingSolveError as original_error:
+                if self.feasibility_recovery_mode == "off":
+                    raise
+                self._last_restoration_used = True
+                q_a_recovery = q_a_n_last
+                last_retry_error: RetargetingSolveError | None = None
+                restored_q = q_n
+                restoration_cost = float("inf")
+                for restoration_attempt in range(1, self.restoration_max_steps + 1):
+                    self._last_restoration_attempt_count = restoration_attempt
+                    try:
+                        restored_q, restoration_cost = self.solve_single_iteration(
+                            q_a_n_last=q_a_recovery, restoration=True, **solve_kwargs
+                        )
+                    except RetargetingSolveError as restoration_error:
+                        original_error.add_context(
+                            restoration_attempted=True,
+                            restoration_attempt_count=restoration_attempt,
+                            restoration_status=restoration_error.status,
+                            restoration_diagnostics=restoration_error.diagnostics,
+                        )
+                        raise original_error
+                    q_a_recovery = restored_q[self.q_a_indices]
+                    try:
+                        q_n, cost = self.solve_single_iteration(q_a_n_last=q_a_recovery, **solve_kwargs)
+                        last_retry_error = None
+                        break
+                    except RetargetingSolveError as retry_error:
+                        last_retry_error = retry_error
+                if last_retry_error is not None:
+                    q_n = restored_q
+                    cost = restoration_cost
+                    self._last_solver_status = "restored_optimal"
             if np.isclose(cost, last_cost):
                 break
             last_cost = cost
@@ -1558,8 +1752,6 @@ class InteractionMeshRetargeter:
         T[dadr : dadr + 3, qadr : qadr + 3] = np.eye(3)
 
         # Angular block: ω_* = 2 * E_*(q) * quat_dot
-        w, x, y, z = self.robot_data.qpos[qadr + 3 : qadr + 7]
-
         def get_e_world(qw, qx, qy, qz):
             return np.array(
                 [

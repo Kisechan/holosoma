@@ -12,9 +12,9 @@ from typing import Any
 import cvxpy as cp  # type: ignore[import-not-found]
 import numpy as np
 
-
 SUCCESS_STATUSES = (cp.OPTIMAL, cp.OPTIMAL_INACCURATE)
 COLLISION_CONSTRAINT_MODES = {"hard", "soft"}
+FEASIBILITY_RECOVERY_MODES = {"off", "fixed", "adaptive"}
 
 
 class RetargetingSolveError(RuntimeError):
@@ -85,7 +85,13 @@ def write_failure_artifacts(
         partial = np.asarray(partial_qpos, dtype=float)
         partial_path = Path(partial_path)
         partial_path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez(partial_path, qpos=partial, completed_frames=np.asarray(len(partial), dtype=np.int32))
+        partial_payload = {
+            "qpos": partial,
+            "completed_frames": np.asarray(len(partial), dtype=np.int32),
+        }
+        if "fps" in diagnostics:
+            partial_payload["fps"] = np.asarray(diagnostics["fps"], dtype=np.float32)
+        np.savez(partial_path, **partial_payload)
 
     repo_root = Path(__file__).resolve().parents[5]
     completed_frames = int(diagnostics.get("completed_frames", 0))
@@ -134,6 +140,14 @@ def validate_collision_constraint_mode(mode: str) -> str:
     return normalized
 
 
+def validate_feasibility_recovery_mode(mode: str) -> str:
+    """Return a normalized recovery mode used by the three M3 ablations."""
+    normalized = str(mode).lower()
+    if normalized not in FEASIBILITY_RECOVERY_MODES:
+        raise ValueError(f"feasibility_recovery_mode must be one of {sorted(FEASIBILITY_RECOVERY_MODES)}")
+    return normalized
+
+
 def build_collision_constraint(
     expr: cp.Expression,
     rhs: float,
@@ -159,6 +173,30 @@ def build_collision_constraint(
     return constraints, float(slack_weight) * cp.sum_squares(slack), slack
 
 
+def build_interval_constraint(
+    expr: cp.Expression,
+    lower: np.ndarray,
+    upper: np.ndarray,
+    mode: str,
+    slack_weight: float,
+    max_slack: float | None = None,
+    name: str = "interval_slack",
+) -> tuple[list[cp.Constraint], cp.Expression | None, cp.Variable | None]:
+    """Build a hard or elastic vector interval with one nonnegative slack per axis."""
+    normalized = validate_collision_constraint_mode(mode)
+    if normalized == "hard":
+        return [expr >= lower, expr <= upper], None, None
+    if slack_weight <= 0:
+        raise ValueError(f"slack_weight must be positive, got {slack_weight}")
+    if max_slack is not None and max_slack < 0:
+        raise ValueError(f"max_slack must be non-negative or None, got {max_slack}")
+    slack = cp.Variable(expr.shape, nonneg=True, name=name)
+    constraints: list[cp.Constraint] = [expr + slack >= lower, expr - slack <= upper]
+    if max_slack is not None:
+        constraints.append(slack <= max_slack)
+    return constraints, float(slack_weight) * cp.sum_squares(slack), slack
+
+
 def summarize_slack_variables(slack_variables: dict[str, list[cp.Variable]]) -> dict[str, dict[str, float | int]]:
     """Summarize solved slack variables by constraint group."""
     summary: dict[str, dict[str, float | int]] = {}
@@ -170,11 +208,45 @@ def summarize_slack_variables(slack_variables: dict[str, list[cp.Variable]]) -> 
             values.append(np.asarray(variable.value, dtype=float).reshape(-1))
         flat = np.concatenate(values) if values else np.zeros(0, dtype=float)
         summary[group] = {
-            "count": int(len(variables)),
+            "count": len(variables),
             "max_slack": float(np.max(flat, initial=0.0)),
+            "mean_slack": float(np.mean(flat)) if flat.size else 0.0,
             "sum_slack": float(np.sum(flat)),
         }
     return summary
+
+
+def update_trust_region(
+    radius: float,
+    predicted_residual: float,
+    actual_residual: float,
+    *,
+    min_radius: float,
+    max_radius: float,
+    shrink_factor: float = 0.5,
+    grow_factor: float = 1.25,
+    acceptance_ratio: float = 0.25,
+) -> float:
+    """Update a trust radius from predicted and measured nonlinear residuals."""
+    values = (radius, predicted_residual, actual_residual, min_radius, max_radius)
+    if not all(np.isfinite(value) for value in values):
+        action = "shrink"
+    else:
+        lower = predicted_residual * (1.0 - acceptance_ratio)
+        upper = predicted_residual * (1.0 + acceptance_ratio)
+        if actual_residual > upper:
+            action = "shrink"
+        elif actual_residual < lower:
+            action = "grow"
+        else:
+            action = "keep"
+    if action == "shrink":
+        new_radius = max(min_radius, radius * shrink_factor)
+    elif action == "grow":
+        new_radius = min(max_radius, radius * grow_factor)
+    else:
+        new_radius = radius
+    return float(new_radius)
 
 
 def _solve_status(constraints: list[cp.Constraint]) -> str:
@@ -232,7 +304,12 @@ def diagnose_constraint_groups(
 
     elastic_status = "not_run"
     group_slack: dict[str, dict[str, float]] = {
-        name: {"max_slack": float("nan"), "sum_slack": float("nan")} for name in active
+        name: {
+            "max_slack": float("nan"),
+            "mean_slack": float("nan"),
+            "sum_slack": float("nan"),
+        }
+        for name in active
     }
     if objective_terms:
         try:
@@ -246,6 +323,7 @@ def diagnose_constraint_groups(
                     )
                     group_slack[name] = {
                         "max_slack": float(np.max(values, initial=0.0)),
+                        "mean_slack": float(np.mean(values)) if values.size else 0.0,
                         "sum_slack": float(np.sum(values)),
                     }
         except Exception as exc:  # pragma: no cover - solver backend failures vary

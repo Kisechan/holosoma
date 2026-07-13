@@ -114,6 +114,24 @@ class RetargeterConfig:
     collision_max_slack: float | None = None
     """Optional upper bound for elastic collision slack."""
 
+    feasibility_recovery_mode: str = "off"
+    """Recovery ablation: off (baseline), fixed, or adaptive trust region."""
+
+    restoration_collision_slack_weight: float = 1e6
+    """Collision slack weight used only by the restoration QP."""
+
+    restoration_foot_slack_weight: float = 1e5
+    """Foot-sticking slack weight used only by the restoration QP."""
+
+    restoration_collision_max_slack: float | None = None
+    """Optional collision slack cap used only during restoration."""
+
+    restoration_foot_max_slack: float | None = None
+    """Optional foot-sticking slack cap used only during restoration."""
+
+    restoration_max_steps: int = 1
+    """Maximum elastic recovery steps before declaring the hard SQP retry infeasible."""
+
     foot_sticking_tolerance: float = 1e-3
     """Tolerance for foot sticking constraints in x, y."""
 
@@ -122,6 +140,14 @@ class RetargeterConfig:
 
     step_size: float = 0.2
     """Trust region for each SQP iteration."""
+
+    adaptive_min_step_size: float = 0.025
+    adaptive_max_step_size: float = 0.4
+    adaptive_shrink_factor: float = 0.5
+    adaptive_grow_factor: float = 1.25
+
+    initial_unbounded_retry: bool = True
+    """Legacy first-frame fallback that removes the trust-region SOC after failure."""
 
     visualize: bool = False
     """Whether to visualize the retargeting process."""

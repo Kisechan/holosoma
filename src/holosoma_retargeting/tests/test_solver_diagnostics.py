@@ -3,13 +3,14 @@ from __future__ import annotations
 import cvxpy as cp
 import numpy as np
 import pytest
-
 from holosoma_retargeting.src.solver_diagnostics import (
     SUCCESS_STATUSES,
     RetargetingSolveError,
     build_collision_constraint,
+    build_interval_constraint,
     diagnose_constraint_groups,
     summarize_slack_variables,
+    update_trust_region,
     write_failure_artifacts,
 )
 
@@ -33,6 +34,7 @@ def test_joint_limit_and_trust_region_conflict_is_attributed() -> None:
     assert _is_success(result["elastic_status"])
     total_slack = sum(item["sum_slack"] for item in result["group_slack"].values())
     assert total_slack >= 0.99
+    assert all("mean_slack" in item for item in result["group_slack"].values())
 
 
 def test_foot_and_collision_conflict_is_attributed() -> None:
@@ -85,6 +87,131 @@ def test_hard_collision_keeps_infeasible_conflict() -> None:
     assert problem.status == cp.INFEASIBLE
     assert objective is None
     assert slack is None
+
+
+def test_soft_foot_interval_slack_is_independent_from_collision_slack() -> None:
+    delta = cp.Variable(2)
+    collision_constraints, collision_objective, collision_slack = build_collision_constraint(
+        delta[0], 1.0, mode="soft", slack_weight=100.0, name="collision_slack"
+    )
+    foot_constraints, foot_objective, foot_slack = build_interval_constraint(
+        delta[1],
+        lower=0.5,
+        upper=0.75,
+        mode="soft",
+        slack_weight=10.0,
+        name="foot_sticking_slack",
+    )
+    problem = cp.Problem(
+        cp.Minimize(collision_objective + foot_objective),
+        [delta == 0.0, *collision_constraints, *foot_constraints],
+    )
+    problem.solve(solver=cp.CLARABEL)
+
+    assert _is_success(problem.status)
+    assert collision_slack is not None
+    assert foot_slack is not None
+    assert collision_slack is not foot_slack
+    assert float(np.asarray(collision_slack.value)) == pytest.approx(1.0, abs=1e-5)
+    assert float(np.asarray(foot_slack.value)) == pytest.approx(0.5, abs=1e-5)
+
+    summary = summarize_slack_variables(
+        {
+            "robot_object_collision": [collision_slack],
+            "foot_sticking": [foot_slack],
+        }
+    )
+    assert summary["robot_object_collision"]["max_slack"] == pytest.approx(1.0, abs=1e-5)
+    assert summary["foot_sticking"]["max_slack"] == pytest.approx(0.5, abs=1e-5)
+
+
+def test_hard_foot_interval_preserves_infeasible_conflict() -> None:
+    delta = cp.Variable(1)
+    constraints, objective, slack = build_interval_constraint(
+        delta,
+        lower=np.asarray([0.5]),
+        upper=np.asarray([0.75]),
+        mode="hard",
+        slack_weight=10.0,
+        name="foot_sticking_slack",
+    )
+    problem = cp.Problem(cp.Minimize(0), [delta == 0.0, *constraints])
+    problem.solve(solver=cp.CLARABEL)
+
+    assert problem.status == cp.INFEASIBLE
+    assert objective is None
+    assert slack is None
+
+
+def test_soft_foot_interval_honors_max_slack() -> None:
+    delta = cp.Variable(1)
+    constraints, objective, slack = build_interval_constraint(
+        delta,
+        lower=np.asarray([0.5]),
+        upper=np.asarray([0.75]),
+        mode="soft",
+        slack_weight=10.0,
+        max_slack=0.25,
+        name="foot_sticking_slack",
+    )
+    problem = cp.Problem(cp.Minimize(objective), [delta == 0.0, *constraints])
+    problem.solve(solver=cp.CLARABEL)
+
+    assert problem.status == cp.INFEASIBLE
+    assert slack is not None
+
+
+@pytest.mark.parametrize(
+    ("predicted_residual", "actual_residual", "expected_radius"),
+    [
+        (0.02, 0.04, 0.1),
+        (0.02, 0.021, 0.2),
+        (0.02, 0.005, 0.4),
+    ],
+)
+def test_adaptive_trust_region_scales_from_prediction_quality(
+    predicted_residual: float,
+    actual_residual: float,
+    expected_radius: float,
+) -> None:
+    radius = update_trust_region(
+        radius=0.2,
+        predicted_residual=predicted_residual,
+        actual_residual=actual_residual,
+        min_radius=0.05,
+        max_radius=0.5,
+        shrink_factor=0.5,
+        grow_factor=2.0,
+        acceptance_ratio=0.25,
+    )
+
+    assert radius == pytest.approx(expected_radius)
+
+
+def test_adaptive_trust_region_clamps_to_bounds() -> None:
+    shrunk = update_trust_region(
+        radius=0.06,
+        predicted_residual=0.01,
+        actual_residual=0.1,
+        min_radius=0.05,
+        max_radius=0.5,
+        shrink_factor=0.5,
+        grow_factor=2.0,
+        acceptance_ratio=0.25,
+    )
+    grown = update_trust_region(
+        radius=0.4,
+        predicted_residual=0.1,
+        actual_residual=0.0,
+        min_radius=0.05,
+        max_radius=0.5,
+        shrink_factor=0.5,
+        grow_factor=2.0,
+        acceptance_ratio=0.25,
+    )
+
+    assert shrunk == pytest.approx(0.05)
+    assert grown == pytest.approx(0.5)
 
 
 def test_collision_constraint_mode_validation() -> None:

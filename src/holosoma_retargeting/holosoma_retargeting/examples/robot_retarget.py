@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Literal
@@ -484,6 +485,17 @@ def build_retargeter_kwargs_from_config(
         "collision_constraint_mode": retargeter_config.collision_constraint_mode,
         "collision_slack_weight": retargeter_config.collision_slack_weight,
         "collision_max_slack": retargeter_config.collision_max_slack,
+        "feasibility_recovery_mode": retargeter_config.feasibility_recovery_mode,
+        "restoration_collision_slack_weight": retargeter_config.restoration_collision_slack_weight,
+        "restoration_foot_slack_weight": retargeter_config.restoration_foot_slack_weight,
+        "restoration_collision_max_slack": retargeter_config.restoration_collision_max_slack,
+        "restoration_foot_max_slack": retargeter_config.restoration_foot_max_slack,
+        "restoration_max_steps": retargeter_config.restoration_max_steps,
+        "adaptive_min_step_size": retargeter_config.adaptive_min_step_size,
+        "adaptive_max_step_size": retargeter_config.adaptive_max_step_size,
+        "adaptive_shrink_factor": retargeter_config.adaptive_shrink_factor,
+        "adaptive_grow_factor": retargeter_config.adaptive_grow_factor,
+        "initial_unbounded_retry": retargeter_config.initial_unbounded_retry,
         "foot_sticking_tolerance": retargeter_config.foot_sticking_tolerance,
         "self_collision": retargeter_config.self_collision,
         "step_size": retargeter_config.step_size,
@@ -642,8 +654,6 @@ def main(cfg: RetargetingConfig) -> None:
 
     # Task-specific object setup: set default object_dir for climbing if not provided
     if task_type == "climbing" and cfg.task_config.object_dir is None:
-        from dataclasses import replace
-
         cfg.task_config = replace(cfg.task_config, object_dir=data_path / task_name)
 
     constants = create_task_constants(
@@ -681,7 +691,7 @@ def main(cfg: RetargetingConfig) -> None:
     if task_type == "robot_only":
         human_joints = preprocess_motion_data(human_joints, retargeter, toe_names, smpl_scale)
     elif task_type in {"object_interaction", "climbing"}:
-        human_joints, object_poses, object_moving_frame_idx = preprocess_motion_data(
+        human_joints, object_poses, _object_moving_frame_idx = preprocess_motion_data(
             human_joints,
             retargeter,
             toe_names,
