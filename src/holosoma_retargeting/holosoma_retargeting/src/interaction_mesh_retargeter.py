@@ -512,6 +512,7 @@ class InteractionMeshRetargeter:
                         failing_object_pose=np.asarray(object_poses[i], dtype=float),
                         failing_object_pose_augmented=np.asarray(object_poses_augmented[i], dtype=float),
                         completed_frames=len(retargeted_motions) - 1,
+                        total_frames=num_frames,
                     )
                     raise
                 frame_costs.append(float(cost))
@@ -966,6 +967,7 @@ class InteractionMeshRetargeter:
                 collision_records.append(
                     {
                         "pair": [int(key[0]), int(key[1])],
+                        "geom_names": [self._geom_names[int(key[0])], self._geom_names[int(key[1])]],
                         "group": group_name,
                         "phi": float(phi),
                         "rhs": float(rhs),
@@ -1040,14 +1042,52 @@ class InteractionMeshRetargeter:
 
         if problem.status not in SUCCESS_STATUSES:
             attribution = diagnose_constraint_groups(base_constraints, constraint_groups)
+            joint_lower_margin = np.asarray(q_a_n_last - self.q_a_lb, dtype=float)
+            joint_upper_margin = np.asarray(self.q_a_ub - q_a_n_last, dtype=float)
+            joint_active_epsilon = 1e-4
+            joint_limit_active_count = int(
+                np.count_nonzero(
+                    (joint_lower_margin <= joint_active_epsilon)
+                    | (joint_upper_margin <= joint_active_epsilon)
+                )
+            )
+            foot_residuals: list[float] = []
+            for target in foot_targets:
+                lower = np.asarray(target["lower"], dtype=float).reshape(-1)
+                upper = np.asarray(target["upper"], dtype=float).reshape(-1)
+                foot_residuals.extend(np.maximum(lower, 0.0).tolist())
+                foot_residuals.extend(np.maximum(-upper, 0.0).tolist())
+            collision_residuals = [max(0.0, float(record["rhs"])) for record in collision_records]
+            group_residual_at_zero = {
+                "collision": {
+                    "max": float(np.max(collision_residuals, initial=0.0)),
+                    "mean": float(np.mean(collision_residuals)) if collision_residuals else 0.0,
+                },
+                "foot_sticking": {
+                    "max": float(np.max(foot_residuals, initial=0.0)),
+                    "mean": float(np.mean(foot_residuals)) if foot_residuals else 0.0,
+                },
+                "joint_limits": {
+                    "max": float(
+                        max(
+                            np.max(-joint_lower_margin, initial=0.0),
+                            np.max(-joint_upper_margin, initial=0.0),
+                        )
+                    ),
+                    "mean": 0.0,
+                },
+                "trust_region": {"max": 0.0, "mean": 0.0},
+            }
             diagnostics = {
                 **attribution,
                 "q_current": np.asarray(q, dtype=float),
                 "q_previous_frame": np.asarray(q_t_last, dtype=float),
                 "q_locked": np.asarray(q_locked, dtype=float),
                 "q_actuated_current": np.asarray(q_a_n_last, dtype=float),
-                "joint_lower_margin": np.asarray(q_a_n_last - self.q_a_lb, dtype=float),
-                "joint_upper_margin": np.asarray(self.q_a_ub - q_a_n_last, dtype=float),
+                "joint_lower_margin": joint_lower_margin,
+                "joint_upper_margin": joint_upper_margin,
+                "joint_limit_active_epsilon": joint_active_epsilon,
+                "joint_limit_active_count": joint_limit_active_count,
                 "foot_sticking": dict(foot_sticking),
                 "foot_targets": foot_targets,
                 "collision_constraints": collision_records,
@@ -1058,6 +1098,7 @@ class InteractionMeshRetargeter:
                 ),
                 "self_collision_constraints": self_collision_records,
                 "trust_region_radius": float(self.step_size),
+                "group_residual_at_zero_step": group_residual_at_zero,
                 "q_a_indices": np.asarray(self.q_a_indices, dtype=int),
             }
             raise RetargetingSolveError(

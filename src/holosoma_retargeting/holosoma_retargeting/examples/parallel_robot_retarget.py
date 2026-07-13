@@ -41,6 +41,10 @@ from holosoma_retargeting.examples.robot_retarget import (  # type: ignore[impor
 from holosoma_retargeting.src.interaction_mesh_retargeter import (  # noqa: E402
     InteractionMeshRetargeter,  # type: ignore[import-not-found]
 )
+from holosoma_retargeting.src.solver_diagnostics import (  # noqa: E402
+    RetargetingSolveError,
+    write_failure_artifacts,
+)
 from holosoma_retargeting.src.utils import (  # type: ignore[import-not-found]  # noqa: E402
     extract_foot_sticking_sequence_velocity,
     preprocess_motion_data,
@@ -144,7 +148,7 @@ def extract_task_name(file_path):
     return Path(file_path).stem
 
 
-def process_single_task(args):
+def _process_single_task(args):
     """Process a single task with all augmentations.
 
     This function follows the same structure as main() in robot_retarget.py,
@@ -289,19 +293,75 @@ def process_single_task(args):
             continue
 
         # Retarget motion
-        retargeted_motions, _, _, _ = retargeter.retarget_motion(
-            human_joint_motions=human_joints,
-            object_poses=object_poses,
-            object_poses_augmented=object_poses_augmented,
-            object_points_local_demo=object_local_pts_demo,
-            object_points_local=object_local_pts,
-            foot_sticking_sequences=foot_sticking_sequences,
-            q_a_init=q_init,
-            q_nominal_list=q_nominal,
-            original=(k == 0),
-            dest_res_path=file_name,
-            fps=30.0,
+        try:
+            retargeted_motions, _, _, _ = retargeter.retarget_motion(
+                human_joint_motions=human_joints,
+                object_poses=object_poses,
+                object_poses_augmented=object_poses_augmented,
+                object_points_local_demo=object_local_pts_demo,
+                object_points_local=object_local_pts,
+                foot_sticking_sequences=foot_sticking_sequences,
+                q_a_init=q_init,
+                q_nominal_list=q_nominal,
+                original=(k == 0),
+                dest_res_path=file_name,
+                fps=30.0,
+            )
+        except RetargetingSolveError as exc:
+            exc.add_context(
+                sequence=task_name,
+                augmentation=aug_name,
+                source_path=str(file_path),
+                intended_output_path=str(file_name),
+                task_type=task_type,
+                data_format=data_format,
+                object_name=str(constants.OBJECT_NAME),
+            )
+            raise
+
+
+def process_single_task(args):
+    """Run one task and persist structured diagnostics for every failure."""
+    file_path, save_dir, task_type, data_format, *_ = args
+    task_name = extract_task_name(file_path)
+    try:
+        return _process_single_task(args)
+    except RetargetingSolveError as exc:
+        augmentation = str(exc.diagnostics.get("augmentation", "original"))
+        stem = f"{task_name}_{augmentation}"
+        failure_path = Path(save_dir) / f"{stem}_failure.json"
+        partial_path = Path(save_dir) / f"{stem}_partial.npz"
+        write_failure_artifacts(
+            exc,
+            failure_path,
+            partial_path=partial_path,
+            metadata={
+                "source_path": str(file_path),
+                "save_dir": str(save_dir),
+                "task_type": task_type,
+                "data_format": data_format,
+            },
         )
+        raise
+    except Exception as exc:
+        wrapped = RetargetingSolveError(
+            status=f"error:{type(exc).__name__}",
+            frame_idx=-1,
+            sqp_iteration=-1,
+            diagnostics={
+                "sequence": task_name,
+                "augmentation": "setup",
+                "source_path": str(file_path),
+                "exception_type": type(exc).__name__,
+                "exception_message": str(exc),
+            },
+        )
+        write_failure_artifacts(
+            wrapped,
+            Path(save_dir) / f"{task_name}_setup_failure.json",
+            metadata={"task_type": task_type, "data_format": data_format},
+        )
+        raise
 
 
 def main(cfg: ParallelRetargetingConfig) -> None:

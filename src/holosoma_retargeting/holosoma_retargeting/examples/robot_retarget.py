@@ -29,6 +29,10 @@ from holosoma_retargeting.config_types.task import TaskConfig  # noqa: E402
 from holosoma_retargeting.src.interaction_mesh_retargeter import (  # noqa: E402
     InteractionMeshRetargeter,  # type: ignore[import-not-found]
 )
+from holosoma_retargeting.src.solver_diagnostics import (  # noqa: E402
+    RetargetingSolveError,
+    write_failure_artifacts,
+)
 from holosoma_retargeting.src.utils import (  # noqa: E402
     augment_object_poses,
     calculate_scale_factor,
@@ -710,19 +714,44 @@ def main(cfg: RetargetingConfig) -> None:
 
     # Retarget motion
     logger.info("Starting retargeting...")
-    retargeter.retarget_motion(
-        human_joint_motions=human_joints,
-        object_poses=object_poses,
-        object_poses_augmented=object_poses_augmented,
-        object_points_local_demo=object_local_pts_demo,
-        object_points_local=object_local_pts,
-        foot_sticking_sequences=foot_sticking_sequences,
-        q_a_init=q_init,
-        q_nominal_list=q_nominal,
-        original=not cfg.augmentation,
-        dest_res_path=dest_res_path,
-        fps=motion_fps,
-    )
+    try:
+        retargeter.retarget_motion(
+            human_joint_motions=human_joints,
+            object_poses=object_poses,
+            object_poses_augmented=object_poses_augmented,
+            object_points_local_demo=object_local_pts_demo,
+            object_points_local=object_local_pts,
+            foot_sticking_sequences=foot_sticking_sequences,
+            q_a_init=q_init,
+            q_nominal_list=q_nominal,
+            original=not cfg.augmentation,
+            dest_res_path=dest_res_path,
+            fps=motion_fps,
+        )
+    except RetargetingSolveError as exc:
+        augmentation = "augmented" if cfg.augmentation else "original"
+        exc.add_context(
+            sequence=task_name,
+            augmentation=augmentation,
+            source_path=str(cfg.data_path / f"{task_name}.pt"),
+            intended_output_path=str(dest_res_path),
+            task_type=task_type,
+            data_format=data_format,
+            object_name=str(constants.OBJECT_NAME),
+        )
+        stem = f"{task_name}_{augmentation}"
+        write_failure_artifacts(
+            exc,
+            Path(save_dir) / f"{stem}_failure.json",
+            partial_path=Path(save_dir) / f"{stem}_partial.npz",
+            metadata={
+                "source_path": str(cfg.data_path),
+                "save_dir": str(save_dir),
+                "task_type": task_type,
+                "data_format": data_format,
+            },
+        )
+        raise
     logger.info("Retargeting complete. Results saved to: %s", dest_res_path)
 
     if cfg.retargeter.debug:

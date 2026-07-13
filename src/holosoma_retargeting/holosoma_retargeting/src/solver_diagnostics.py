@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import json
+import platform
+import subprocess
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import cvxpy as cp  # type: ignore[import-not-found]
@@ -34,6 +39,84 @@ class RetargetingSolveError(RuntimeError):
     def add_context(self, **values: Any) -> None:
         """Attach frame-level state while preserving the original solver evidence."""
         self.diagnostics.update(values)
+
+
+def _jsonable(value: Any) -> Any:
+    """Convert diagnostic values to deterministic JSON-compatible objects."""
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(item) for item in value]
+    if isinstance(value, float) and not np.isfinite(value):
+        return str(value)
+    return value
+
+
+def _git_commit(path: Path) -> str | None:
+    try:
+        return subprocess.check_output(
+            ["git", "-C", str(path), "rev-parse", "HEAD"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def write_failure_artifacts(
+    error: RetargetingSolveError,
+    failure_path: Path,
+    *,
+    partial_path: Path | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Persist one solver failure and an optional partial trajectory sidecar."""
+    failure_path = Path(failure_path)
+    failure_path.parent.mkdir(parents=True, exist_ok=True)
+    diagnostics = dict(error.diagnostics)
+    partial_qpos = diagnostics.pop("partial_qpos", None)
+    if partial_qpos is not None and partial_path is not None:
+        partial = np.asarray(partial_qpos, dtype=float)
+        partial_path = Path(partial_path)
+        partial_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(partial_path, qpos=partial, completed_frames=np.asarray(len(partial), dtype=np.int32))
+
+    repo_root = Path(__file__).resolve().parents[5]
+    completed_frames = int(diagnostics.get("completed_frames", 0))
+    total_frames = int(diagnostics.get("total_frames", 0))
+    payload = {
+        "schema_version": "1.0.0",
+        "sequence": diagnostics.get("sequence"),
+        "augmentation": diagnostics.get("augmentation", "original"),
+        "retarget_success": False,
+        "completed_frames": completed_frames,
+        "total_frames": total_frames,
+        "completed_frame_ratio": completed_frames / total_frames if total_frames else 0.0,
+        "first_infeasible_frame": error.frame_idx,
+        "first_infeasible_sqp_iteration": error.sqp_iteration,
+        "clarabel_status": error.status,
+        "error": str(error),
+        "diagnostics": _jsonable(diagnostics),
+        "artifacts": {
+            "failure_json": str(failure_path),
+            "partial_npz": str(partial_path) if partial_qpos is not None and partial_path is not None else None,
+        },
+        "provenance": {
+            **_jsonable(metadata or {}),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "python": platform.python_version(),
+            "root_git_commit": _git_commit(repo_root),
+            "holosoma_git_commit": _git_commit(repo_root / "holosoma"),
+        },
+    }
+    failure_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    return payload
 
 
 def constraint_size(constraint: cp.Constraint) -> int:

@@ -10,6 +10,7 @@ from holosoma_retargeting.src.solver_diagnostics import (
     build_collision_constraint,
     diagnose_constraint_groups,
     summarize_slack_variables,
+    write_failure_artifacts,
 )
 
 
@@ -90,3 +91,32 @@ def test_collision_constraint_mode_validation() -> None:
     delta = cp.Variable(1)
     with pytest.raises(ValueError, match="collision_constraint_mode"):
         build_collision_constraint(delta, 1.0, mode="elastic", slack_weight=100.0)
+
+
+def test_failure_artifacts_preserve_diagnostics_and_partial_trajectory(tmp_path) -> None:
+    error = RetargetingSolveError(
+        "infeasible",
+        frame_idx=4,
+        sqp_iteration=2,
+        diagnostics={
+            "sequence": "sub12_largebox_000",
+            "augmentation": "original",
+            "completed_frames": 4,
+            "total_frames": 10,
+            "partial_qpos": np.zeros((4, 43)),
+            "constraint_group_counts": {"foot_sticking": 4, "joint_limits": 58},
+            "group_slack": {"foot_sticking": {"max_slack": np.float64(0.003)}},
+        },
+    )
+    failure_path = tmp_path / "sequence_original_failure.json"
+    partial_path = tmp_path / "sequence_original_partial.npz"
+
+    payload = write_failure_artifacts(error, failure_path, partial_path=partial_path)
+
+    assert failure_path.exists()
+    assert partial_path.exists()
+    assert payload["first_infeasible_frame"] == 4
+    assert payload["completed_frame_ratio"] == 0.4
+    assert payload["diagnostics"]["group_slack"]["foot_sticking"]["max_slack"] == 0.003
+    with np.load(partial_path) as partial:
+        assert partial["qpos"].shape == (4, 43)
