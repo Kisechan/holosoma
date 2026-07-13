@@ -34,6 +34,8 @@ class TaskConfig:
     surface_weight_high: int = 20  # Weight for top surface points (z > threshold)
     surface_weight_low: int = 1  # Weight for other points
 
-    # Object directory (for climbing tasks)
-    # Auto-determined from data_path / task_name if None
+    # Object directory for generated external assets. For object_interaction it
+    # contains <object_name>.obj, <object_name>.urdf and
+    # g1_29dof_w_<object_name>.xml. For climbing it retains the existing
+    # per-terrain directory meaning.
     object_dir: Path | None = None

@@ -120,9 +120,16 @@ def create_task_constants(
     elif task_type == "object_interaction":
         obj_name = task_config.object_name or "largebox"
         task_constants.OBJECT_NAME = obj_name
-        task_constants.OBJECT_URDF_FILE = f"models/{obj_name}/{obj_name}.urdf"
-        task_constants.OBJECT_MESH_FILE = f"models/{obj_name}/{obj_name}.obj"
-        task_constants.OBJECT_URDF_TEMPLATE = f"models/templates/{obj_name}.urdf.jinja"
+        object_dir = task_config.object_dir
+        if object_dir is None:
+            task_constants.OBJECT_URDF_FILE = f"models/{obj_name}/{obj_name}.urdf"
+            task_constants.OBJECT_MESH_FILE = f"models/{obj_name}/{obj_name}.obj"
+            task_constants.OBJECT_URDF_TEMPLATE = f"models/templates/{obj_name}.urdf.jinja"
+        else:
+            task_constants.OBJECT_DIR = str(object_dir)
+            task_constants.OBJECT_URDF_FILE = str(object_dir / f"{obj_name}.urdf")
+            task_constants.OBJECT_MESH_FILE = str(object_dir / f"{obj_name}.obj")
+            task_constants.SCENE_XML_FILE = str(object_dir / f"g1_29dof_w_{obj_name}.xml")
     elif task_type == "climbing":
         obj_name = task_config.object_name or "multi_boxes"
         task_constants.OBJECT_NAME = obj_name

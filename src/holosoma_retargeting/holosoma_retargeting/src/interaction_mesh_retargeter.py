@@ -136,7 +136,10 @@ class InteractionMeshRetargeter:
             self._setup_visualization()
 
         # Load Mujoco model
-        if self.object_name == "ground":
+        external_scene_xml = getattr(self.task_constants, "SCENE_XML_FILE", "")
+        if external_scene_xml:
+            robot_xml_path = external_scene_xml
+        elif self.object_name == "ground":
             robot_xml_path = self.robot_model_path.replace(".urdf", ".xml")
         elif self.object_name == "multi_boxes":
             robot_xml_path = self.task_constants.SCENE_XML_FILE
